@@ -1,0 +1,48 @@
+system_prompt: |
+  You are a medical data extraction assistant. You must extract structured information from a patient's medical history.
+
+user_prompt: |
+  Step 1: Extract the required fields from the report using the given schema. Count carefully.
+  
+  Step 2: Perform a self-audit:
+  - For every value in the JSON object, check if it is correct.
+  - Do not rely on assumptions. Only use evidence from the text.
+  - Be concise: use 1-2 sentences to justify each correction.
+
+  Step 3: Output a final/corrected JSON object using the evaluation of Step 2. 
+
+  Schema:
+    "Lung_RADS_present": true/false,
+    "Highest_Lung_RADS": "1", "2", "2/S", "3", "4A", "4B", "4X" or null,
+    "Lowest_Lung_RADS": "1", "2", "2/S", "3", "4A", "4B", "4X" or null,
+    "Total_Number_of_reports": integer,
+    "Number_of_reports_with_Lung_RADS_values": integer, count the reports which explicitly state a Lung-RADS value,
+    "List_of_included_Lung_RADS_values": ["value1", "value2", ...], values that are explicitly stated in the reports,
+    "Earliest_report_mentioning_of_Lung_RADS": extract from header of report in format "YYYY-MM-DD" or null,
+    "Latest_report_mentioning_of_Lung_RADS": "YYYY-MM-DD", same as earliest if only one report stating Lung-RADS value or null if none.
+
+  Only output the JSON — no extra text.
+
+  Medical history:
+  {report}
+
+grammar: |
+  root ::= allrecords
+
+  allrecords ::= (
+      "{"
+        ws "\"Lung_RADS_present\":" ws ( "true" | "false" ) ","
+        ws "\"Highest_Lung_RADS\":" ws ( "\"" ( "1" | "2" | "2/S" | "3" | "4A" | "4B" | "4X" ) "\"" | "null" ) ","
+        ws "\"Lowest_Lung_RADS\":" ws ( "\"" ( "1" | "2" | "2/S" | "3" | "4A" | "4B" | "4X" ) "\"" | "null" ) ","
+        ws "\"Total_Number_of_reports\":" ws [0-9]+ ","
+        ws "\"Number_of_reports_with_Lung_RADS_values\":" ws [0-9]+ ","
+        ws "\"List_of_included_Lung_RADS_values\":" ws lrlist ","
+        ws "\"Earliest_report_mentioning_of_Lung_RADS\":" ws ( "\"" [0-9]{4} "-" [0-9]{2} "-" [0-9]{2} "\"" | "null" ) ","
+        ws "\"Latest_report_mentioning_of_Lung_RADS\":" ws ( "\"" [0-9]{4} "-" [0-9]{2} "-" [0-9]{2} "\"" | "null" )
+      ws "}"
+      ws
+  )
+
+  ws ::= [ \t\n\r]*
+  lrlist ::= "[" ws ( "\"" ( "1" | "2" | "2/S" | "3" | "4A" | "4B" | "4X" ) "\"" ( ws "," ws "\"" ( "1" | "2" | "2/S" | "3" | "4A" | "4B" | "4X" ) "\"" )* )? ws "]"
+
