@@ -1,6 +1,6 @@
 
 import os
-import glob
+import glob 
 import pandas as pd
 import argparse
 import json
@@ -16,8 +16,15 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 import ast
 import re
-from utils import extract_chest_radreports
-
+from utils import extract_mod_reports
+MODELS = [
+    {"name": "Meditron", "filename": "models/meditron-7b.Q4_K_M.gguf"},
+    {"name": "Med-Gemma", "filename": "models/medgemma-4b-it-Q4_K_M.gguf"},
+    {"name": "Qwen3-Thinking", "filename": "models/Qwen3-4B-Thinking-2507-Q4_K_M.gguf"},
+    {"name": "Llama3.1-8B", "filename": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"},
+    {"name": "GLM-4.5-Air", "filename": "models/GLM-4.5-Air-Q4_K_M/Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"},
+    {"name": "Qwen3-Instruct", "filename": "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"},
+]
 
 # Utility functions from utils.py
 def is_empty_string_nan_or_none(variable) -> bool:
@@ -33,12 +40,12 @@ def is_empty_string_nan_or_none(variable) -> bool:
         return False
     if isinstance(variable, float) and math.isnan(variable):
         return True
-    if isinstance(variable, int) or isinstance(variable, bool) or isinstance(variable, float):
+    if isinstance(variable, int) or isinstance(variable, bool):
         return False
     if isinstance(variable, list):
         return len(variable) == 0
-    # If variable is not a recognized type, we assume it's invalid and return True.
-    return True
+    # If variable is not a recognized type (dict, list with items, etc.), return False
+    return False
 
 
 # Core LLM processing class adapted from routes.py
@@ -48,10 +55,10 @@ class TextProcessor:
     api_model: bool
     prompt: str
     system_prompt: str = "You are a helpful assistant that helps extract information from medical reports."
-    temperature: float = 0.0
+    temperature: float = 0.1
     grammar: str = ""
     json_schema: str = ""
-    n_predict: int = 2048
+    n_predict: int = 8192
     chat_endpoint: bool = False
     debug: bool = False
     llamacpp_port: int = 2929
@@ -223,14 +230,39 @@ def postprocess_grammar(results, debug=False):
         
         # Parse the content string into a dictionary
         try:
+            # Clean up content
             if content.endswith("<|eot_id|>"):
                 content = content[: -len("<|eot_id|>")]
             if content.endswith("</s>"):
                 content = content[: -len("</s>")]
-            # search for last } in content and remove anything after that
-            content = content[: content.rfind("}") + 1]
             
-            # replace all backslash in the content string with nothing
+            # Extract all JSON objects from the content
+            json_objects = []
+            # Find all {...} patterns
+            brace_count = 0
+            start_idx = -1
+            
+            for idx, char in enumerate(content):
+                if char == '{':
+                    if brace_count == 0:
+                        start_idx = idx
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        # Found a complete JSON object
+                        json_str = content[start_idx:idx+1]
+                        json_objects.append(json_str)
+                        start_idx = -1
+            
+            print(f"Found {len(json_objects)} JSON object(s) in output")
+            
+            # Use the last JSON object if available
+            if json_objects:
+                content = json_objects[-1]
+                print(f"Using last JSON object for parsing")
+            
+            # Clean the selected JSON string
             content = content.replace("\n","")
             content = content.replace("\r","")
             content = content.replace("\\", "")
@@ -254,6 +286,9 @@ def postprocess_grammar(results, debug=False):
             for key, value in info_dict_raw.items():
                 if is_empty_string_nan_or_none(value):
                     info_dict[key] = ""
+                elif isinstance(value, (list, dict)):
+                    # Convert lists and dicts to JSON strings
+                    info_dict[key] = json.dumps(value)
                 else:
                     info_dict[key] = str(value)
                     
@@ -420,16 +455,16 @@ async def main():
                        help='Use OpenAI-compatible API instead of local model')
 
     # LLM parameters
-    parser.add_argument('--temperature', '-t', type=float, default=0.0,
+    parser.add_argument('--temperature', '-t', type=float, default=0.1,
                        help='Temperature (0.0-1.0)')
-    parser.add_argument('--n_predict', '-n', type=int, default=2048,
+    parser.add_argument('--n_predict', '-n', type=int, default=8192,
                        help='Maximum tokens to predict')
     parser.add_argument('--top_k', type=int, default=30, help='Top-k sampling')
     parser.add_argument('--top_p', type=float, default=0.9, help='Top-p sampling')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # Grammar and schema
-    parser.add_argument('--prompts-file', default='prompt_across_report.yaml', 
+    parser.add_argument('--prompts-file', default='prompts/prompt_reasoning.yaml', 
                    help='YAML file containing prompts and grammar (default: prompts.yaml)')
 
     parser.add_argument('--json_schema', help='JSON schema for structured output')
@@ -446,92 +481,161 @@ async def main():
     
     parser.add_argument('--per_report', action='store_true', 
                        help='Process each report separately instead of combining into full history')
-
+    parser.add_argument('--modality', type=str, default='RAD', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
     args = parser.parse_args()
 
     prompts_config = load_prompts_config(args.prompts_file)
 
-
+    
     system_prompt = prompts_config['system_prompt']
     user_prompt = prompts_config['user_prompt']
     grammar = prompts_config['grammar']
-
+    num_text = 3
     # get patient_id from yaml file
     if not os.path.exists(args.patient_id_file):
         print(f"Error: Patient ID file {args.patient_id_file} not found")
         return 1
 
     with open(args.patient_id_file, 'r') as f:
-        patient_id = f.read().strip()
+        data = yaml.safe_load(f)
+        patient_ids = data["patient_id"]
 
-    # Validate input directory
-    if not os.path.isdir(args.input_dir):
-        print(f"Error: Input directory {args.input_dir} does not exist")
-        return 1
-
-    # Read text files
-    if args.per_report:
-        print(f"Analysing text files from: {args.input_dir} seperately")
-        texts = read_text_files(args.input_dir)
-
-        if not texts:
-            print("No .txt files found in input directory")
+    raw_dir = f"outputs/raw/{args.model_name}"
+    OUTPUT_FILE = 'outputs/all_model_results.json'
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    summary = []
+    successful = 0
+    failed = 0
+    # loop all the below logics for each patient_id
+    for patient_id in patient_ids:
+        events = []
+        print(f"Processing patient ID: {patient_id}")
+        # Validate input directory
+        if not os.path.isdir(args.input_dir):
+            print(f"Error: Input directory {args.input_dir} does not exist")
             return 1
 
-        print(f"Found {len(texts)} text files to process")
-    else: 
-        # full history 
-        print(f"Combining all text files from: {args.input_dir} into one history")
-        full_history = extract_chest_radreports(args.input_dir, patient_id) # write_full_history(args.input_dir)
-        # save full history to a text file
-        with open(f"full_history_{patient_id}.txt", "w", encoding="utf-8") as f:
-            f.write(full_history)
+        # Read text files
+        if args.per_report:
+            print(f"Analysing text files from: {args.input_dir} seperately")
+            texts = read_text_files(args.input_dir)
 
-        texts = [{"id": "full_history", "text": full_history, "filename": "full_history.txt"}]
-       
+            if not texts:
+                print("No .txt files found in input directory")
+                return 1
+            if num_text > len(texts):
+                texts = texts[:num_text]
 
-    # Initialize processor
-    processor = TextProcessor(
-        model_name=args.model,
-        api_model=args.api_model,
-        prompt=user_prompt,
-        system_prompt=system_prompt,
-        temperature=args.temperature,
-        grammar=grammar or "",
-        json_schema=args.json_schema or "",
-        n_predict=args.n_predict,
-        chat_endpoint=args.chat_endpoint,
-        debug=args.debug,
-        llamacpp_port=args.llamacpp_port,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        seed=args.seed
-    )
+            print(f"Found {len(texts)} text files to process")
+        else: 
+            # full history 
+            print(f"Combining all text files from: {args.input_dir} into one history")
+            
+            full_history = extract_mod_reports(args.input_dir, patient_id, args.modality)
+            # save full history to a text file
+            with open(f"data/full_history_{patient_id}_{args.modality}.txt", "w", encoding="utf-8") as f:
+                f.write(full_history)
 
-    print(f"Processing texts with model: {args.model}")
-    print(f"Using {'chat' if args.chat_endpoint else 'completion'} endpoint")
-    print(f"Using {'API' if args.api_model else 'local'} model")
+            texts = [{"id": "full_history", "text": full_history, "filename": f"full_history_{patient_id}_{args.modality}.txt"}]
 
-    # Process input
-    start_time = time.time()
-    results = await processor.process_all_texts(texts)
-    end_time = time.time()
-    
-       
-    print(f"Processing completed in {end_time - start_time:.2f} seconds")
+        # Initialize processor
+        processor = TextProcessor(
+            model_name=args.model_name,
+            api_model=args.api_model,
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=args.temperature,
+            grammar=grammar or "",
+            json_schema=args.json_schema or "",
+            n_predict=args.n_predict,
+            chat_endpoint=args.chat_endpoint,
+            debug=args.debug,
+            llamacpp_port=args.llamacpp_port,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            seed=args.seed
+        )
 
-    # Save results
-    df, error_count = postprocess_grammar(results, debug=args.debug)
-    
-    # Save the processed DataFrame
-    df.to_csv(f"resultsfullhistory{patient_id}.csv", index=False)
+        print(f"Processing texts with model: {args.model}")
+        print(f"Using {'chat' if args.chat_endpoint else 'completion'} endpoint")
+        print(f"Using {'API' if args.api_model else 'local'} model")
 
+        # Process input
+        start_time = time.time()
+        result = await processor.process_all_texts(texts)
+        end_time = time.time()
+        
+        
+        print(f"Processing completed in {end_time - start_time:.2f} seconds")
+
+        # Save raw model output to text file
+        raw_output_file = f"raw_outputs/raw_output_{patient_id}.txt"
+        with open(raw_output_file, 'w', encoding='utf-8') as f:
+            f.write(f"Raw Model Output for Patient {patient_id}\n")
+            f.write("=" * 80 + "\n\n")
+            for res in result:
+                if isinstance(res, Exception):
+                    f.write(f"ERROR: {str(res)}\n\n")
+                else:
+                    f.write(f"ID: {res.get('id', 'unknown')}\n")
+                    f.write("-" * 80 + "\n")
+                    f.write(f"CONTENT:\n{res.get('content', '')}\n")
+                    f.write("-" * 80 + "\n\n")
+        print(f"Raw model output saved to: {raw_output_file}")
+
+        if isinstance(result, dict) and 'date' in result:
+            events.append({
+                "date": result["date"],
+                "modality": "RAD",
+                "extracted_evidence": result.get("extracted_evidence", ""),
+                "quote": result.get("quote", "")
+            })
+        elif isinstance(result, list):
+            for ev in result:
+                if 'date' in ev:
+                    events.append({
+                        "date": ev["date"],
+                        "modality": "RAD",
+                        "extracted_evidence": ev.get("extracted_evidence", ""),
+                        "quote": ev.get("quote", "")
+                    })
+
+        successful = successful + 1 if result is not isinstance(result, Exception) else successful
+        failed = failed + 1 if result is isinstance(result, Exception) else failed
+        
+    summary.append({
+        "task": "event_extraction_report",
+        "model": args.model_name,
+        "patient_id": patient_id,
+        "events_extracted": events
+    })
+    with open(f"outputs/summary_{args.model_name}.json", "w") as fsum:
+        json.dump(summary, fsum, indent=2)
+
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r") as f:
+            all_results = json.load(f)
+    else:
+        all_results = []
+
+    all_results.extend(summary)
+
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(all_results, f, indent=2)
+        # Save results
+        # df, error_count = postprocess_grammar(result, debug=args.debug)
+        
+        # Save the processed DataFrame
+        # df.to_csv(f"results/resultsfullhistory{patient_id}.csv", index=False)
+
+        
     # Print summary
-    successful = sum(1 for r in results if not isinstance(r, Exception) and not r.get("error"))
-    failed = len(results) - successful
+    # successful = sum(1 for r in result if not isinstance(r, Exception) and not r.get("error"))
+    # failed = len(result) - successful
 
     print(f"\nSummary:")
-    print(f"- Total files: {len(texts)}")
+    print(f"- Total files: {len(patient_ids)}")
     print(f"- Successful: {successful}")
     print(f"- Failed: {failed}")
 
