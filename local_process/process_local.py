@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 import ast
 import re
-from utils import extract_mod_reports
+from utils import extract_mod_reports, extract_single_reports, extract_last_json_from_text
 MODELS = [
     {"name": "Meditron", "filename": "models/meditron-7b.Q4_K_M.gguf"},
     {"name": "Med-Gemma", "filename": "models/medgemma-4b-it-Q4_K_M.gguf"},
@@ -182,7 +182,7 @@ class TextProcessor:
                 "id": text_id, 
                 "content": content, 
                 "prompt": prompt_formatted,
-                "report": text,  # Add original text
+                # "report": text,  # Add original text
                 "raw_result": result if self.debug else None
             }
         except Exception as e:
@@ -355,30 +355,6 @@ def load_prompts_config(prompts_file: str) -> dict:
     }
 
 
-def get_model_config(model_path: str, config_file: str, model_filename: str) -> dict:
-    """Get model configuration from config file"""
-    if not os.path.isabs(config_file):
-        config_file = os.path.join(model_path, config_file)
-
-    config_data = load_config(config_file)
-
-    for model_dict in config_data.get("models", []):
-        if model_dict.get("file_name") == model_filename:
-            return model_dict
-
-    # Return default config if not found
-    return {
-        "name": model_filename,
-        "file_name": model_filename,
-        "display_name": model_filename,
-        "server_slots": 1,
-        "n_gpu_layers": 0,
-        "kv_cache_size": 2048,
-        "model_context_size": 2048,
-        "seed": 42
-    }
-
-
 def read_text_files(input_dir: str) -> List[Dict[str, str]]:
     """Read all .txt files from input directory"""
     txt_files = glob.glob(os.path.join(input_dir, "*.txt"))
@@ -438,6 +414,59 @@ def save_results_to_csv(results: List[Dict[str, Any]], output_file: str):
     df.to_csv(output_file, index=False)
     print(f"Results saved to: {output_file}")
 
+def extract_content(res):
+    """
+    Extract structured information from model response.
+    Handles both new structured format and fallback parsing.
+    """
+    try:
+        content = res.get('content', '')
+        if isinstance(content, dict):
+            parsed = content
+        elif isinstance(content, str):
+            # Remove markdown code blocks if present
+            content_clean = content.strip()
+            if content_clean.startswith('```json'):
+                content_clean = content_clean.split('```json', 1)[1]
+            if content_clean.startswith('```'):
+                content_clean = content_clean.split('```', 1)[1]
+            if content_clean.endswith('```'):
+                content_clean = content_clean.rsplit('```', 1)[0]
+            
+            content_clean = content_clean.strip()
+            
+            
+            try:
+                parsed = json.loads(content_clean)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract JSON from text
+                import re
+                json_match = re.search(r'\{.*\}', content_clean, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                else:
+                    print(f"WARNING: Could not parse JSON from content")
+                    return None
+        else:
+            parsed = content
+        
+        # Extract fields from new structured format
+        event = {
+            'patient_id': res.get('id', 'unknown'),
+            'reasoning': parsed.get('reasoning', ''),
+            'surgeries': parsed.get('surgeries', []),
+            'surgery_count': parsed.get('surgery_count', 0),
+            'diagnoses': parsed.get('diagnoses', []),
+            'diagnosis_count': parsed.get('diagnosis_count', 0),
+            'raw_content': content  # Keep raw content for debugging
+        }
+        
+        return event
+        
+    except Exception as e:
+        print(f"ERROR in extract_content: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return None
 
 async def main():
     parser = argparse.ArgumentParser(description='Process text files with LLM')
@@ -446,7 +475,7 @@ async def main():
     parser.add_argument('--input_dir', default=f'/Users/carlotta/Desktop/Code_MT/data/timeline_ds_STS', help='Directory containing .txt files to process') # data/auxiliary_task_reports/{patient_id}
     parser.add_argument('--patient_id_file', default='patient_ids.yaml', help='YAML file containing patient ID')
     # Model arguments
-    parser.add_argument('--model', '-m', required=True, 
+    parser.add_argument('--model_name', '-m', required=True, 
                        help='Model filename or API model name')
     parser.add_argument('--chat_endpoint', action='store_true', 
                        help='Use chat endpoint instead of completion')
@@ -464,14 +493,11 @@ async def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # Grammar and schema
-    parser.add_argument('--prompts-file', default='prompts/prompt_reasoning.yaml', 
+    parser.add_argument('--prompts-file', default='./prompts/event_extraction_VIS.yaml', 
                    help='YAML file containing prompts and grammar (default: prompts.yaml)')
 
     parser.add_argument('--json_schema', help='JSON schema for structured output')
 
-    # Configuration
-    parser.add_argument('--model_path', default='models', 
-                       help='Path to model directory')
     parser.add_argument('--config_file', default='models/config.yml',
                        help='Model configuration file')
     parser.add_argument('--llamacpp_port', type=int, default=8080,
@@ -481,7 +507,7 @@ async def main():
     
     parser.add_argument('--per_report', action='store_true', 
                        help='Process each report separately instead of combining into full history')
-    parser.add_argument('--modality', type=str, default='RAD', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
+    parser.add_argument('--modality', type=str, default='OPN', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
     args = parser.parse_args()
 
     prompts_config = load_prompts_config(args.prompts_file)
@@ -500,7 +526,7 @@ async def main():
         data = yaml.safe_load(f)
         patient_ids = data["patient_id"]
 
-    raw_dir = f"outputs/raw/{args.model_name}"
+    raw_dir = f"outputs/{args.model_name}"
     OUTPUT_FILE = 'outputs/all_model_results.json'
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
@@ -519,7 +545,7 @@ async def main():
         # Read text files
         if args.per_report:
             print(f"Analysing text files from: {args.input_dir} seperately")
-            texts = read_text_files(args.input_dir)
+            texts = extract_single_reports(args.input_dir, patient_id, args.modality)
 
             if not texts:
                 print("No .txt files found in input directory")
@@ -557,59 +583,66 @@ async def main():
             seed=args.seed
         )
 
-        print(f"Processing texts with model: {args.model}")
+        print(f"Processing texts with model: {args.model_name}")
         print(f"Using {'chat' if args.chat_endpoint else 'completion'} endpoint")
         print(f"Using {'API' if args.api_model else 'local'} model")
 
         # Process input
         start_time = time.time()
+        
         result = await processor.process_all_texts(texts)
         end_time = time.time()
         
-        
+        print(f"Result: \n {result}")
         print(f"Processing completed in {end_time - start_time:.2f} seconds")
 
         # Save raw model output to text file
-        raw_output_file = f"raw_outputs/raw_output_{patient_id}.txt"
+        raw_output_file = os.path.join(raw_dir, f"{args.modality}/raw_output_{patient_id}.txt")
         with open(raw_output_file, 'w', encoding='utf-8') as f:
             f.write(f"Raw Model Output for Patient {patient_id}\n")
-            f.write("=" * 80 + "\n\n")
+            f.write("="*80 + "\n\n")
             for res in result:
                 if isinstance(res, Exception):
                     f.write(f"ERROR: {str(res)}\n\n")
                 else:
                     f.write(f"ID: {res.get('id', 'unknown')}\n")
-                    f.write("-" * 80 + "\n")
+                    f.write("-"*80 + "\n")
                     f.write(f"CONTENT:\n{res.get('content', '')}\n")
-                    f.write("-" * 80 + "\n\n")
+                    f.write("="*80 + "\n\n")
         print(f"Raw model output saved to: {raw_output_file}")
 
-        if isinstance(result, dict) and 'date' in result:
-            events.append({
-                "date": result["date"],
-                "modality": "RAD",
-                "extracted_evidence": result.get("extracted_evidence", ""),
-                "quote": result.get("quote", "")
-            })
-        elif isinstance(result, list):
-            for ev in result:
-                if 'date' in ev:
-                    events.append({
-                        "date": ev["date"],
-                        "modality": "RAD",
-                        "extracted_evidence": ev.get("extracted_evidence", ""),
-                        "quote": ev.get("quote", "")
-                    })
+        for res in result:
+            if isinstance(res, Exception):
+                continue
+                
+            if isinstance(res, dict) and 'content' in res and not res.get('error'):
+                event = extract_content(res)
+                if event:
+                    events.append(event)
+            elif isinstance(res, list):
+                # handle nested event lists
+                for ev in res:
+                    if isinstance(ev, dict) and 'content' in ev and not ev.get('error'):
+                        event = extract_content(ev)
+                        if event:
+                            events.append(event)
 
-        successful = successful + 1 if result is not isinstance(result, Exception) else successful
-        failed = failed + 1 if result is isinstance(result, Exception) else failed
-        
-    summary.append({
-        "task": "event_extraction_report",
-        "model": args.model_name,
-        "patient_id": patient_id,
-        "events_extracted": events
-    })
+        # Update success/failure tracking                    
+        if any(not isinstance(res, Exception) and not res.get('error') for res in result):
+            successful += 1
+        else:
+            failed += 1
+
+        # Enhanced summary with new fields
+        summary.append({
+            "task": "event_extraction_report",
+            "model": args.model_name,
+            "patient_id": patient_id,
+            "total_surgeries": sum(e.get('surgery_count', 0) for e in events),
+            "total_diagnoses": sum(e.get('diagnosis_count', 0) for e in events),
+            "events_extracted": events
+        })
+
     with open(f"outputs/summary_{args.model_name}.json", "w") as fsum:
         json.dump(summary, fsum, indent=2)
 
