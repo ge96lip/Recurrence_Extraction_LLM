@@ -130,7 +130,17 @@ class TextProcessor:
 
         async with session.post(url=url, headers=headers, json=data, 
                               timeout=aiohttp.ClientTimeout(total=20*60)) as response:
-            return await response.json()
+            result = await response.json()
+            
+            # Check for error responses
+            if "error" in result:
+                raise ValueError(f"Server error: {result.get('error', {}).get('message', 'Unknown error')}")
+            
+            # Check if response has expected format
+            if "choices" not in result:
+                raise ValueError(f"Unexpected response format from server: {result}")
+                
+            return result
 
     async def fetch_completion_result(self, session: aiohttp.ClientSession, prompt_formatted: str) -> dict:
         """Fetch result from local llama.cpp server using completion endpoint"""
@@ -416,56 +426,113 @@ def save_results_to_csv(results: List[Dict[str, Any]], output_file: str):
 
 def extract_content(res):
     """
-    Extract structured information from model response.
-    Handles both new structured format and fallback parsing.
+    General-purpose JSON extraction from model response.
+    Handles markdown formatting, multiple JSON blocks, and various output formats.
+    Works with any JSON schema - not specific to surgeries/diagnoses.
     """
     try:
         content = res.get('content', '')
+        
         if isinstance(content, dict):
-            parsed = content
+            # Already parsed - return as-is with metadata
+            return {
+                'patient_id': res.get('id', 'unknown'),
+                'extracted_data': content,
+                'raw_content': json.dumps(content)
+            }
+            
         elif isinstance(content, str):
-            # Remove markdown code blocks if present
-            content_clean = content.strip()
-            if content_clean.startswith('```json'):
-                content_clean = content_clean.split('```json', 1)[1]
-            if content_clean.startswith('```'):
-                content_clean = content_clean.split('```', 1)[1]
-            if content_clean.endswith('```'):
-                content_clean = content_clean.rsplit('```', 1)[0]
+            # Strategy 1: Find all JSON objects in the text using brace-matching
+            json_objects = []
+            brace_count = 0
+            start_idx = -1
             
-            content_clean = content_clean.strip()
+            for idx, char in enumerate(content):
+                if char == '{':
+                    if brace_count == 0:
+                        start_idx = idx
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        json_str = content[start_idx:idx+1]
+                        try:
+                            # Try to parse this JSON object
+                            parsed_obj = json.loads(json_str)
+                            json_objects.append(parsed_obj)
+                        except json.JSONDecodeError:
+                            # Try cleaning common issues
+                            cleaned = json_str.replace('\n', '').replace('\r', '').replace('\\', '')
+                            cleaned = re.sub(r',\s*}', '}', cleaned)  # Remove trailing commas
+                            cleaned = re.sub(r',\s*]', ']', cleaned)  # Remove trailing commas in arrays
+                            try:
+                                parsed_obj = json.loads(cleaned)
+                                json_objects.append(parsed_obj)
+                            except:
+                                pass
+                        start_idx = -1
             
+            # Use the last valid JSON object if found
+            parsed = None
+            if json_objects:
+                parsed = json_objects[-1]
+                print(f"✓ Extracted JSON via brace-matching (found {len(json_objects)} objects, using last)")
+            else:
+                # Strategy 2: Try extracting from markdown code blocks
+                code_block_pattern = r'```json\s*(.*?)\s*```'
+                matches = re.findall(code_block_pattern, content, re.DOTALL)
+                
+                if matches:
+                    # Try to parse the last code block
+                    for match in reversed(matches):
+                        try:
+                            parsed = json.loads(match.strip())
+                            print(f"✓ Extracted JSON from markdown code block")
+                            break
+                        except:
+                            continue
             
-            try:
-                parsed = json.loads(content_clean)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, try to extract JSON from text
-                import re
-                json_match = re.search(r'\{.*\}', content_clean, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group(0))
-                else:
-                    print(f"WARNING: Could not parse JSON from content")
-                    return None
+            if not parsed:
+                print(f"WARNING: No valid JSON found in content for {res.get('id', 'unknown')}")
+                print(f"Content preview: {content[:300]}...")
+                return None
+            
+            # Return general structure that works with ANY schema
+            # For backwards compatibility with surgery/diagnosis extraction:
+            if 'surgeries' in parsed or 'diagnoses' in parsed:
+                result = {
+                    'patient_id': res.get('id', 'unknown'),
+                    'reasoning': parsed.get('reasoning', ''),
+                    'surgeries': parsed.get('surgeries', []),
+                    'surgery_count': parsed.get('surgery_count', len(parsed.get('surgeries', []))),
+                    'diagnoses': parsed.get('diagnoses', []),
+                    'diagnosis_count': parsed.get('diagnosis_count', len(parsed.get('diagnoses', []))),
+                    'raw_content': content,
+                    'extracted_data': parsed  # Full JSON for reference
+                }
+                print(f"✓ Extracted: {result['surgery_count']} surgeries, {result['diagnosis_count']} diagnoses")
+            else:
+                # Generic extraction for any other schema
+                result = {
+                    'patient_id': res.get('id', 'unknown'),
+                    'extracted_data': parsed,  # The actual JSON data
+                    'raw_content': content
+                }
+                # Log what was extracted
+                if isinstance(parsed, dict):
+                    field_summary = ', '.join(f"{k}" for k in parsed.keys())
+                    print(f"✓ Extracted fields: {field_summary}")
+            
+            return result
+            
         else:
-            parsed = content
-        
-        # Extract fields from new structured format
-        event = {
-            'patient_id': res.get('id', 'unknown'),
-            'reasoning': parsed.get('reasoning', ''),
-            'surgeries': parsed.get('surgeries', []),
-            'surgery_count': parsed.get('surgery_count', 0),
-            'diagnoses': parsed.get('diagnoses', []),
-            'diagnosis_count': parsed.get('diagnosis_count', 0),
-            'raw_content': content  # Keep raw content for debugging
-        }
-        
-        return event
+            print(f"WARNING: Content is neither dict nor string: {type(content)}")
+            return None
         
     except Exception as e:
-        print(f"ERROR in extract_content: {str(e)}")
+        print(f"ERROR in extract_content for ID {res.get('id', 'unknown')}: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
+        print(f"Content preview: {str(res.get('content', ''))[:300]}...")
         return None
 
 async def main():
@@ -507,7 +574,7 @@ async def main():
     
     parser.add_argument('--per_report', action='store_true', 
                        help='Process each report separately instead of combining into full history')
-    parser.add_argument('--modality', type=str, default='OPN', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
+    parser.add_argument('--modality', type=str, default='VIS', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
     args = parser.parse_args()
 
     prompts_config = load_prompts_config(args.prompts_file)
