@@ -130,17 +130,7 @@ class TextProcessor:
 
         async with session.post(url=url, headers=headers, json=data, 
                               timeout=aiohttp.ClientTimeout(total=20*60)) as response:
-            result = await response.json()
-            
-            # Check for error responses
-            if "error" in result:
-                raise ValueError(f"Server error: {result.get('error', {}).get('message', 'Unknown error')}")
-            
-            # Check if response has expected format
-            if "choices" not in result:
-                raise ValueError(f"Unexpected response format from server: {result}")
-                
-            return result
+            return await response.json()
 
     async def fetch_completion_result(self, session: aiohttp.ClientSession, prompt_formatted: str) -> dict:
         """Fetch result from local llama.cpp server using completion endpoint"""
@@ -165,13 +155,21 @@ class TextProcessor:
                               timeout=aiohttp.ClientTimeout(total=20*60)) as response:
             return await response.json()
 
-    async def process_text(self, session: aiohttp.ClientSession, text: str, text_id: str) -> Dict[str, Any]:
+    async def process_text(self, session: aiohttp.ClientSession, text: str, text_id: str, report_description: str = None, note_date: str = None) -> Dict[str, Any]:
         """Process a single text and return the result"""
         if is_empty_string_nan_or_none(text):
             print(f"SKIPPING EMPTY TEXT for ID {text_id}")
             return {"id": text_id, "content": "", "error": "Empty text", "report": text}
         
-        prompt_formatted = self.prompt.format(report=text)
+        # Format the report with metadata
+        formatted_report = ""
+        if note_date:
+            formatted_report += f"Date: {note_date}\n"
+        if report_description:
+            formatted_report += f"Description: {report_description}\n"
+        formatted_report += f"Report:\n{text}"
+        
+        prompt_formatted = self.prompt.format(report=formatted_report)
         
         try:
             if self.chat_endpoint:
@@ -206,7 +204,13 @@ class TextProcessor:
 
         async def process_with_semaphore(session, text_data):
             async with semaphore:
-                return await self.process_text(session, text_data["text"], text_data["id"])
+                return await self.process_text(
+                    session, 
+                    text_data["text"], 
+                    text_data["id"], 
+                    text_data.get("report_description"),
+                    text_data.get("note_date")
+                )
 
         async with aiohttp.ClientSession() as session:
             tasks = [process_with_semaphore(session, text_data) for text_data in texts]
@@ -424,116 +428,86 @@ def save_results_to_csv(results: List[Dict[str, Any]], output_file: str):
     df.to_csv(output_file, index=False)
     print(f"Results saved to: {output_file}")
 
-def extract_content(res):
+def extract_content(res, modality):
+    
     """
-    General-purpose JSON extraction from model response.
-    Handles markdown formatting, multiple JSON blocks, and various output formats.
-    Works with any JSON schema - not specific to surgeries/diagnoses.
+    Extract structured information from model response.
+    Handles both new structured format and fallback parsing.
     """
     try:
         content = res.get('content', '')
-        
         if isinstance(content, dict):
-            # Already parsed - return as-is with metadata
-            return {
+            parsed = content
+        elif isinstance(content, str):
+            # Remove markdown code blocks if present
+            content_clean = content.strip()
+            if content_clean.startswith('```json'):
+                content_clean = content_clean.split('```json', 1)[1]
+            if content_clean.startswith('```'):
+                content_clean = content_clean.split('```', 1)[1]
+            if content_clean.endswith('```'):
+                content_clean = content_clean.rsplit('```', 1)[0]
+            
+            content_clean = content_clean.strip()
+            
+            
+            try:
+                parsed = json.loads(content_clean)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract JSON from text
+                import re
+                json_match = re.search(r'\{.*\}', content_clean, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                else:
+                    print(f"WARNING: Could not parse JSON from content")
+                    return None
+        else:
+            parsed = content
+        
+        # Handle if parsed is a list (array) - extract the first element
+        if isinstance(parsed, list):
+            if len(parsed) == 0:
+                print(f"WARNING: Parsed JSON is an empty array for {res.get('id', 'unknown')}")
+                return None
+            # Use the first element if it's an array
+            parsed = parsed[0]
+            print(f"✓ Extracted first element from JSON array")
+        
+        # Extract fields from new structured format
+        if modality == 'VIS':
+            event = {
                 'patient_id': res.get('id', 'unknown'),
-                'extracted_data': content,
-                'raw_content': json.dumps(content)
+                'reasoning': parsed.get('reasoning', ''),
+                'surgeries': parsed.get('surgeries', []),
+                'surgery_count': parsed.get('surgery_count', 0),
+                'diagnoses': parsed.get('diagnoses', []),
+                'diagnosis_count': parsed.get('diagnosis_count', 0),
+                'raw_content': content  # Keep raw content for debugging
             }
             
-        elif isinstance(content, str):
-            # Strategy 1: Find all JSON objects in the text using brace-matching
-            json_objects = []
-            brace_count = 0
-            start_idx = -1
-            
-            for idx, char in enumerate(content):
-                if char == '{':
-                    if brace_count == 0:
-                        start_idx = idx
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_idx != -1:
-                        json_str = content[start_idx:idx+1]
-                        try:
-                            # Try to parse this JSON object
-                            parsed_obj = json.loads(json_str)
-                            json_objects.append(parsed_obj)
-                        except json.JSONDecodeError:
-                            # Try cleaning common issues
-                            cleaned = json_str.replace('\n', '').replace('\r', '').replace('\\', '')
-                            cleaned = re.sub(r',\s*}', '}', cleaned)  # Remove trailing commas
-                            cleaned = re.sub(r',\s*]', ']', cleaned)  # Remove trailing commas in arrays
-                            try:
-                                parsed_obj = json.loads(cleaned)
-                                json_objects.append(parsed_obj)
-                            except:
-                                pass
-                        start_idx = -1
-            
-            # Use the last valid JSON object if found
-            parsed = None
-            if json_objects:
-                parsed = json_objects[-1]
-                print(f"✓ Extracted JSON via brace-matching (found {len(json_objects)} objects, using last)")
-            else:
-                # Strategy 2: Try extracting from markdown code blocks
-                code_block_pattern = r'```json\s*(.*?)\s*```'
-                matches = re.findall(code_block_pattern, content, re.DOTALL)
-                
-                if matches:
-                    # Try to parse the last code block
-                    for match in reversed(matches):
-                        try:
-                            parsed = json.loads(match.strip())
-                            print(f"✓ Extracted JSON from markdown code block")
-                            break
-                        except:
-                            continue
-            
-            if not parsed:
-                print(f"WARNING: No valid JSON found in content for {res.get('id', 'unknown')}")
-                print(f"Content preview: {content[:300]}...")
-                return None
-            
-            # Return general structure that works with ANY schema
-            # For backwards compatibility with surgery/diagnosis extraction:
-            if 'surgeries' in parsed or 'diagnoses' in parsed:
-                result = {
-                    'patient_id': res.get('id', 'unknown'),
-                    'reasoning': parsed.get('reasoning', ''),
-                    'surgeries': parsed.get('surgeries', []),
-                    'surgery_count': parsed.get('surgery_count', len(parsed.get('surgeries', []))),
-                    'diagnoses': parsed.get('diagnoses', []),
-                    'diagnosis_count': parsed.get('diagnosis_count', len(parsed.get('diagnoses', []))),
-                    'raw_content': content,
-                    'extracted_data': parsed  # Full JSON for reference
-                }
-                print(f"✓ Extracted: {result['surgery_count']} surgeries, {result['diagnosis_count']} diagnoses")
-            else:
-                # Generic extraction for any other schema
-                result = {
-                    'patient_id': res.get('id', 'unknown'),
-                    'extracted_data': parsed,  # The actual JSON data
-                    'raw_content': content
-                }
-                # Log what was extracted
-                if isinstance(parsed, dict):
-                    field_summary = ', '.join(f"{k}" for k in parsed.keys())
-                    print(f"✓ Extracted fields: {field_summary}")
-            
-            return result
-            
+            return event
+        elif modality == 'OPN':
+            event = {
+                'patient_id': res.get('id', 'unknown'),
+                'lung_chest_surgery': parsed.get('lung_chest_surgery', False),
+                'reasoning': parsed.get('reasoning', ''),
+                'procedure_type': parsed.get('procedure_type', ''),
+                'date': parsed.get('date', ''),
+                'evidence_snippet': parsed.get('evidence_snippet', ''),
+                'confidence': parsed.get('confidence', ''),
+                'raw_content': content  # Keep raw content for debugging
+            }
+            return event
         else:
-            print(f"WARNING: Content is neither dict nor string: {type(content)}")
+            print(f"Modality {modality} not supported yet.")
             return None
-        
+
     except Exception as e:
-        print(f"ERROR in extract_content for ID {res.get('id', 'unknown')}: {str(e)}")
+        print(f"ERROR in extract_content: {str(e)}")
         print(f"Traceback: {traceback.format_exc()}")
-        print(f"Content preview: {str(res.get('content', ''))[:300]}...")
         return None
+
 
 async def main():
     parser = argparse.ArgumentParser(description='Process text files with LLM')
@@ -560,7 +534,7 @@ async def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # Grammar and schema
-    parser.add_argument('--prompts-file', default='./prompts/event_extraction_VIS.yaml', 
+    parser.add_argument('--prompts-file', default='./prompts/event_extraction_OPN.yaml', 
                    help='YAML file containing prompts and grammar (default: prompts.yaml)')
 
     parser.add_argument('--json_schema', help='JSON schema for structured output')
@@ -584,6 +558,7 @@ async def main():
     user_prompt = prompts_config['user_prompt']
     grammar = prompts_config['grammar']
     num_text = 3
+    print(f"Modality: {args.modality}")
     # get patient_id from yaml file
     if not os.path.exists(args.patient_id_file):
         print(f"Error: Patient ID file {args.patient_id_file} not found")
@@ -660,7 +635,6 @@ async def main():
         result = await processor.process_all_texts(texts)
         end_time = time.time()
         
-        print(f"Result: \n {result}")
         print(f"Processing completed in {end_time - start_time:.2f} seconds")
 
         # Save raw model output to text file
@@ -683,14 +657,14 @@ async def main():
                 continue
                 
             if isinstance(res, dict) and 'content' in res and not res.get('error'):
-                event = extract_content(res)
+                event = extract_content(res, args.modality)
                 if event:
                     events.append(event)
             elif isinstance(res, list):
                 # handle nested event lists
                 for ev in res:
                     if isinstance(ev, dict) and 'content' in ev and not ev.get('error'):
-                        event = extract_content(ev)
+                        event = extract_content(ev, args.modality)
                         if event:
                             events.append(event)
 
