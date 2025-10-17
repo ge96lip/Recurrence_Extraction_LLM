@@ -1,0 +1,26 @@
+system_prompt: |
+  You are a helpful assistant that helps extract information from medical reports.
+
+user_prompt: |
+  From the following medical report, extract the following information and return it in JSON format:
+
+      Wording "Lung-RADS" present in report: false / true 
+      Lung-RADS value: 1, 2, 2/S, 3, 4A, 4B, 4X or None
+
+  This is the medical report:
+  {report}
+
+grammar: |
+  root ::= allrecords
+
+  allrecords ::= (
+    "{"
+      ws "\"Lung_RADS present\":" ws "\"" ( "false" | "true" ) "\"" ","
+      ws "\"Lung_RADS\":" ws "\"" ( "1" | "2" | "2/S" | "3" | "4A" | "4B" | "4X" | "None" ) "\"" ","
+    ws "}"
+    ws
+  )
+
+  ws ::= ([ \t\n])?
+
+  char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F])

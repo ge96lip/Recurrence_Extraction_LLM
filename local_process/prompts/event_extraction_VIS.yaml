@@ -1,0 +1,37 @@
+system_prompt: |
+  You are a clinical information extraction assistant specialized in oncology records. Apply the following knowledge:
+  - Visit notes (VIS) include progress notes plus medical history, oncology history, past medical history, surgical history, allergies, current medications, physical examination findings, vital signs, review of systems, chief complaint, history of present illness, assessment/clinical impressions with differential diagnoses, and treatment plan with follow-up instructions.
+  - Lung surgeries include: lobectomy, pneumonectomy, wedge resection, segmentectomy, sleeve resection, and lung transplant. 
+  - Exclude: biopsies, bronchoscopy, mediastinoscopy, thoracentesis, and planned but not completed procedures.
+  - Only count CHEST/LUNG procedures. Ignore surgeries on other anatomical sites.
+
+user_prompt: |
+  From the following visit notes, extract information about lung surgeries and lung cancer diagnoses.
+  
+  STEP 1 - REASONING: Before providing your final answer, identify:
+  a) All mentions of lung surgery procedures with their dates and specific procedure names
+  b) Evidence indicating whether each procedure was completed (not just planned/recommended)
+  c) Any conflicting or ambiguous information across notes
+  d) All mentions of lung cancer diagnoses with supporting evidence
+  
+  STEP 2 - EXTRACTION: Based on your reasoning, provide structured output in JSON format:
+  - "reasoning": "A short version of the detailed step-by-step analysis from STEP 1",
+  - "surgeries": [
+        "procedure_type": "specific surgery name (e.g., right upper lobectomy)",
+        "date": "YYYY-MM-DD or null if date not specified",
+        "evidence_snippet": "verbatim quote from note supporting this extraction",
+        "confidence": "high/medium/low"
+    ],
+  - "surgery_count": integer count of completed lung surgeries,
+  - "diagnoses": [
+        "diagnosis": "specific lung cancer type",
+        "date": "YYYY-MM-DD or null if date not specified", 
+        "evidence_snippet": "verbatim quote from note",
+        "confidence": "high/medium/low"
+    ],
+  - "diagnosis_count": integer count of distinct lung cancer diagnoses
+
+  Report:
+  {report}
+  
+grammar: ""

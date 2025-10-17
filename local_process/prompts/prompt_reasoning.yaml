@@ -1,0 +1,25 @@
+system_prompt: |
+  You are a medical data extraction assistant. Provide evidence-based reasoning for a clinician about a patient's cancer development based on Lung-RADS history.
+
+user_prompt: |
+  Follow these steps and show short reasoning before the final answer.
+
+  Step 1: Extract structured info from all reports:
+  - Lung_RADS_present: true/false (any mention?)
+  - Number_of_reports_with_Lung_RADS_values: integer count of reports that explicitly state a Lung-RADS value
+  - Time_span_in_days: days between first and last mention (0 if only one)
+
+  Output this in a JSON code block.
+
+  Step 2: Self-audit each field in 1-2 reasoning sentences.
+  - Use 1-2 reasoning sentences per field
+  - Cite evidence from the reports, identify any errors and correct inconsistencies.
+
+  Step 3: Give final corrected JSON.
+
+  Step 4: In 3 sentences, explain the patient's longitudinal cancer development based on Lung-RADS categories, including dates for any diagnosis and relevant events. 
+
+  Medical history:
+  {report}
+
+grammar: ""

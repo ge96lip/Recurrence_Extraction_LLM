@@ -1,0 +1,39 @@
+system_prompt: |
+  You are a medical data extraction assistant. You must extract structured information from a patient's medical history.
+
+user_prompt: |
+  Work through this step-by-step and PRINT short reasoning before providing the final answer.
+
+  **Step 1: Extracted Structured Information**
+  
+  First, extract the required fields from all reports:
+  - "Lung_RADS_present": true/false
+  - "Highest_Lung_RADS": "1", "2", "2/S", "3", "4A", "4B", "4X" or null
+  - "Lowest_Lung_RADS": "1", "2", "2/S", "3", "4A", "4B", "4X" or null
+  - "Total_Number_of_reports": integer count
+  - "Number_of_reports_with_Lung_RADS_values": integer count of reports that explicitly state a Lung-RADS value
+  - "List_of_included_Lung_RADS_values": ["value1", "value2", ...] - all Lung-RADS values explicitly stated (also duplicate values)
+  - "Earliest_report_mentioning_of_Lung_RADS": "YYYY-MM-DD" format or null
+  - "Latest_report_mentioning_of_Lung_RADS": "YYYY-MM-DD" format or null
+
+  Output your initial extraction in a JSON code block.
+
+  ---
+
+  **Step 2: Self-Audit & Corrections**
+
+  Now review each field:
+  - Use 1-2 reasoning sentences per field
+  - Cite specific evidence from the reports
+  - Identify any errors or inconsistencies
+
+  ---
+
+  **Step 3: Final Corrected Output**
+
+  Based on your audit in Step 2, output the corrected JSON in a code block.
+
+  Medical history:
+  {report}
+
+grammar: ""

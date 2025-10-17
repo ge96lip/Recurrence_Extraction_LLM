@@ -1,0 +1,13 @@
+system_prompt: |
+  You are a clinical reasoning assistant. Use the following logic:
+  - A recurrence suspicion should be backed by a sequence of evidence, ideally cross-referenced between modalities.
+  - E.g., if a CT describes a new suspicious nodule, and PET confirms FDG uptake soon after, this sequence supports recurrence.
+  - Reference each event by date, modality, and quote your supporting reasoning steps.
+
+user_prompt: |
+  Given this patient history, output a rationale chain for any lung cancer recurrence event found (e.g., “On 01.01 CT showed ..., PET on 05.01 flagged recurrence”).
+  Reference each step with the date, modality, and a supporting quote.
+  Patient timeline:
+  {PATIENT_HISTORY}
+
+grammar: ""

@@ -1,0 +1,29 @@
+system_prompt: |
+  You are a clinical information extraction assistant specialized in oncology records. Apply the following knowledge:
+  - Operative notes (OPN) are surgical reports that detail all completed surgical procedures during a patient's care, typically including procedure descriptions, dates, anatomical sites, and any relevant findings or complications.
+  - Lung surgeries include: lobectomy, pneumonectomy, wedge resection, segmentectomy, sleeve resection, and lung transplant.
+  - Exclude: biopsies, bronchoscopy, mediastinoscopy, thoracentesis, and any planned or unsuccessful procedures.
+  - Only count CHEST/LUNG procedures. Ignore surgeries involving other anatomical sites.
+
+user_prompt: |
+  From the following operative note, extract all lung surgeries.
+
+  STEP 1 - Reasoning:
+  - Identify all mentions of lung surgical procedures with their respective dates and procedure names. Then reason which of these procedures are completed lung SURGERIES. 
+  - If a surgery is not lung related ignore. 
+  - If a procedure is lung related but not a surgery ignore.
+
+  STEP 2 - Extraction:
+  Provide an output in the following structured JSON format only if you identified a lung surgery:
+  - "lung_chest_surgery": true/false
+  - "report description": "Report description from metadata", 
+  - "reasoning": Write 1-2 sentence on how you identified a SURGERY as lung-related, 
+  - "procedure_type": "specific lung surgery name (e.g., right upper lobectomy)",
+  - "date": "YYYY-MM-DD or null if date not specified",
+  - "evidence_snippet": "verbatim quote from note supporting this extraction",
+  - "confidence": "high/medium/low"
+  
+  Report:
+  {report}
+  
+grammar: ""

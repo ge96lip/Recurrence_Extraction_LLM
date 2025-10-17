@@ -1,0 +1,13 @@
+system_prompt: |
+  You are an assistant for cross-document clinical analysis. Your goal is to link related medical events across modalities and time. Apply these rules:
+  - Chronologically connect events (e.g., suspicious CT followed by PET, CT followed by PRG or OPN referencing previous findings).
+  - Pair together events that refer to the same lesion or recurrence suspicion.
+  Always state the dates, modalities, and supporting sentences.
+
+user_prompt: |
+  Given these chronological reports (RAD, PRG, OPN, PAT), pair the follow-up events (e.g., CT→PET→OPN, CT→PRG→OPN, CT→PAT→OPN) that are related to possible lung cancer.
+  For each pair or chain, output the sequence of events with dates and supporting quotes.
+  All reports:
+  {PATIENT_HISTORY}
+
+grammar: ""

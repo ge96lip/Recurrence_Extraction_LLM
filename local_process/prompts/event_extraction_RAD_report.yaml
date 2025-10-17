@@ -1,0 +1,18 @@
+system_prompt: |
+  You are a clinical information extraction assistant. Apply the following knowledge:
+  - Radiology (RAD) reports do not diagnose but describe nodules and make recommendations.
+  - Mark as suspicious if there is a new lesion, growth/change in nodule size or opacity, or mention of a follow-up (such as PET recommendation).
+  Cite the sentence and date for each suspicious event.
+
+user_prompt: |
+  From the following radiology report, are there any lung cancer suspicious events? 
+  Output the results in JSON format. 
+    date: date of the report in YYYY-MM-DD
+    modality: RAD
+    extracted_event: "the suspicious event (in keypoints), if any, otherwise null"
+    quote: "the supporting quote, if any, otherwise null"
+
+  Report:
+  {report}
+  
+grammar: ""
