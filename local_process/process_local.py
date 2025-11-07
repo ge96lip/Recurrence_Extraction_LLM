@@ -1,487 +1,741 @@
-#!/usr/bin/env python3
-"""
-Recurrence Extraction Script for Lung Cancer VIS Notes
 
-Usage:
-    python run_recurrence_extraction.py --model Qwen3-Instruct [options]
-    
-Examples:
-    # Sequential processing (Mac/single slot)
-    python run_recurrence_extraction.py --model Qwen3-Instruct --max-vis 300
-    
-    # Parallel processing (A100 with --parallel 4)
-    python run_recurrence_extraction.py --model Qwen3-Instruct --parallel 4 --max-vis 300
-    
-    # Process specific patients only
-    python run_recurrence_extraction.py --model Qwen3-Instruct --patient-ids 104352354 107373506
-"""
 
-import argparse
-import asyncio
-import json
 import os
-import sys
+import glob 
 import pandas as pd
-from datetime import datetime
+import argparse
+import json
+import asyncio
+import aiohttp
+import yaml
 from pathlib import Path
+import time
+from datetime import datetime
+import math
+import traceback
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+import ast
+import re
+from utils import extract_mod_reports, extract_single_reports, extract_last_json_from_text
+MODELS = [
+    {"name": "Meditron", "filename": "models/meditron-7b.Q4_K_M.gguf"},
+    {"name": "Med-Gemma", "filename": "models/medgemma-4b-it-Q4_K_M.gguf"},
+    {"name": "Qwen3-Thinking", "filename": "models/Qwen3-4B-Thinking-2507-Q4_K_M.gguf"},
+    {"name": "Llama3.1-8B", "filename": "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"},
+    {"name": "GLM-4.5-Air", "filename": "models/GLM-4.5-Air-Q4_K_M/Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"},
+    {"name": "Qwen3-Instruct", "filename": "models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"},
+]
 
-# Add local_process to path
-sys.path.append('/vast/florian/carlotta/LLMAIx/local_process')
+# Utility functions from utils.py
+def is_empty_string_nan_or_none(variable) -> bool:
+    """
+    Check if the input variable is None, an empty string, a string containing only whitespace or '?', or a NaN float value.
+    """
+    if variable is None:
+        return True
+    if isinstance(variable, str):
+        stripped = variable.strip()
+        if stripped == "" or stripped == "?" or variable.isspace():
+            return True
+        return False
+    if isinstance(variable, float) and math.isnan(variable):
+        return True
+    if isinstance(variable, int) or isinstance(variable, bool):
+        return False
+    if isinstance(variable, list):
+        return len(variable) == 0
+    # If variable is not a recognized type (dict, list with items, etc.), return False
+    return False
 
-from process_local import TextProcessor, load_prompts_config
-from utils import extract_single_reports
 
+# Core LLM processing class adapted from routes.py
+@dataclass
+class TextProcessor:
+    model_name: str
+    api_model: bool
+    prompt: str
+    system_prompt: str = "You are a helpful assistant that helps extract information from medical reports."
+    temperature: float = 0.1
+    grammar: str = ""
+    json_schema: str = ""
+    n_predict: int = 512
+    chat_endpoint: bool = False
+    debug: bool = False
+    llamacpp_port: int = 2929
+    top_k: int = 30
+    top_p: float = 0.9
+    seed: int = 42
 
-async def process_patient_recurrence_task(
-    patient_id: str, 
-    data_dir: str, 
-    prompts_file: str, 
-    prompt_version: str, 
-    patient_meta: pd.DataFrame, 
-    output_root: str, 
-    max_vis_reports: int = None,
-    model_name: str = "Qwen3-Instruct",
-    llamacpp_port: int = 8080
-):
-    """Process each VIS report for recurrence extraction (sequential)."""
-    print(f"patient_id: {patient_id}")
-    
-    # Get patient metadata
-    patient_row = patient_meta[patient_meta["EMPI"] == str(patient_id)]
-    
-    if patient_row.empty:
-        print(f"ERROR: Patient {patient_id} not found in patient_meta!")
-        return None
-    
-    first_surgery_date = patient_row['indexSurgery'].iloc[0]
-    print(f"first_surgery_date: {first_surgery_date}")
-    
-    if pd.isna(first_surgery_date) or not first_surgery_date:
-        print(f"Missing first lung surgery date for patient {patient_id}")
-        return None
+    # OpenAI client placeholder
+    openai_client: Optional[Any] = None
 
-    vis_reports = extract_single_reports(data_dir, patient_id, 'VIS')
-    if not vis_reports:
-        print(f"No VIS reports found for patient {patient_id}")
-        return None
-    if max_vis_reports:
-        vis_reports = vis_reports[:max_vis_reports]
-    
-    # Load prompts config
-    prompts_config = load_prompts_config(prompts_file)
-    system_prompt = prompts_config['system_prompt']
-    user_prompt_template = prompts_config['user_prompt']
+    def __post_init__(self):
+        if self.api_model and self.openai_client is None:
+            print("Warning: OpenAI client not initialized for API model")
 
-    shared_processor = TextProcessor(
-            model_name=model_name,
-            api_model=False,
-            prompt="{report}",
-            system_prompt=system_prompt,
-            temperature=0.1,
-            grammar="",
-            n_predict=4096,
-            chat_endpoint=True,
-            debug=False,
-            llamacpp_port=llamacpp_port
-        )
-    
-    recurrence_results = []
-    for i, vis_report in enumerate(vis_reports):
-        if i % 10 == 0:
-            print(f"  Processing VIS report {i+1}/{len(vis_reports)} for patient {patient_id}")
-        
-        vis_date = vis_report['note_date']
-        vis_text = vis_report['text']
-        
-        user_prompt = user_prompt_template.format(
-            first_lung_surgery_date=first_surgery_date,
-            vis_note_text=vis_text
-        )
-        
-        texts = [{"id": vis_report['id'], "text": user_prompt}]
-        try:
-            results = await shared_processor.process_all_texts(texts)
-            output_json = None
-            if results and results[0] and not results[0].get('error'):
-                result = results[0]
-                content = result.get('content', '')
-                if '```json' in content:
-                    content = content.split('```json')[-1].split('```')[0]
-                
-                try:
-                    output_json = json.loads(content)
-                except Exception as e:
-                    print(f"Failed to parse JSON for {patient_id} VIS {vis_report['id']}: {e}")
-            else:
-                print(f"Model error for {patient_id} VIS {vis_report['id']}")
-            
-            result_entry = {
-                "vis_id": vis_report['id'],
-                "vis_date": vis_date,
-                "surgery_date": str(first_surgery_date),
-                "output": output_json if output_json else {"error": True}
+    async def fetch_chat_result_openai(self, session: aiohttp.ClientSession, prompt_formatted: str) -> dict:
+        """Fetch result from OpenAI-compatible API using chat endpoint"""
+        if self.openai_client is None:
+            raise ValueError("OpenAI client not initialized")
+
+        data = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt_formatted}
+            ],
+            "temperature": self.temperature,
+            "max_tokens": self.n_predict, 
+            "stop": ["<|im_end|>", "<|eot_id|>", "</s>"] 
+        }
+
+        if self.json_schema and self.json_schema not in ["", None, " ", "  "]:
+            data["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "schema": self.json_schema,
+                    "strict": True
+                }
             }
-            recurrence_results.append(result_entry)
+
+        # Simulate OpenAI call, for real use self.openai_client
+        # response = await asyncio.to_thread(self.openai_client.chat.completions.create, **data)
+        # return {"choices": [{"message": {"content": response.choices[0].message.content}}]}
+
+        # For now, return a mock response
+        return {"choices": [{"message": {"content": "Mock API response"}}]}
+
+    async def fetch_chat_result_local(self, session: aiohttp.ClientSession, prompt_formatted: str) -> dict:
+        """Fetch result from local llama.cpp server using chat endpoint"""
+        url = f"http://localhost:{self.llamacpp_port}/v1/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer no-key"}
+
+        data = {
+            "model": "llmaix",
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt_formatted}
+            ],
+            "seed": self.seed,
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "top_p": self.top_p, 
+            "max_tokens": self.n_predict, 
+            "stop": ["<|im_end|>", "<|eot_id|>", "</s>"] 
+        }
+
+        if self.grammar and self.grammar not in ["", None, " ", "  "]:
+            data["grammar"] = self.grammar
+
+        if self.json_schema and self.json_schema not in ["", None, " ", "  "]:
+            data["json_schema"] = self.json_schema
+
+        async with session.post(url=url, headers=headers, json=data, 
+                              timeout=aiohttp.ClientTimeout(total=20*60)) as response:
+            text = await response.text()
+            response.raise_for_status()
+            try:
+                return json.loads(text)
+            except Exception:
+                print("RAW RESPONSE (first 500):", text[:500])
+                raise
+
+    async def fetch_completion_result(self, session: aiohttp.ClientSession, prompt_formatted: str) -> dict:
+        """Fetch result from local llama.cpp server using completion endpoint"""
+        json_data = {
+            "prompt": prompt_formatted,
+            "n_predict": self.n_predict,
+            "temperature": self.temperature,
+            "cache_prompt": True,
+            "seed": self.seed,
+            "top_k": self.top_k,
+            "top_p": self.top_p
+        }
+
+        if self.grammar and self.grammar not in ["", None, " ", "  "]:
+            json_data["grammar"] = self.grammar
+
+        if self.json_schema and self.json_schema not in ["", None, " ", "  "]:
+            json_data["json_schema"] = self.json_schema
+
+        async with session.post(f"http://localhost:{self.llamacpp_port}/completion", 
+                              json=json_data, 
+                              timeout=aiohttp.ClientTimeout(total=20*60)) as response:
+            return await response.json()
+
+    async def process_text(self, session: aiohttp.ClientSession, text: str, text_id: str, report_description: str = None, note_date: str = None) -> Dict[str, Any]:
+        """Process a single text and return the result"""
+        if is_empty_string_nan_or_none(text):
+            print(f"SKIPPING EMPTY TEXT for ID {text_id}")
+            return {"id": text_id, "content": "", "error": "Empty text", "report": text}
+        
+        # Format the report with metadata
+        formatted_report = ""
+        if note_date:
+            formatted_report += f"Date: {note_date}\n"
+        if report_description:
+            formatted_report += f"Description: {report_description}\n"
+        formatted_report += f"Report:\n{text}"
+        
+        prompt_formatted = self.prompt.format(report=formatted_report)
+        
+        try:
+            if self.chat_endpoint:
+                if self.api_model:
+                    result = await self.fetch_chat_result_openai(session, prompt_formatted)
+                    content = result["choices"][0]["message"]["content"]
+                else:
+                    result = await self.fetch_chat_result_local(session, prompt_formatted)
+                    content = result["choices"][0]["message"]["content"]
+            else:
+                if self.api_model:
+                    raise NotImplementedError("OpenAI-compatible API does not support non-chat completion")
+                else:
+                    result = await self.fetch_completion_result(session, prompt_formatted)
+                    content = result.get("content", "")
+            
+            return {
+                "id": text_id, 
+                "content": content, 
+                "prompt": prompt_formatted,
+                # "report": text,  # Add original text
+                "raw_result": result if self.debug else None
+            }
         except Exception as e:
-            print(f"Exception for {patient_id} VIS {vis_report['id']}: {e}")
+            print(f"Error processing text {text_id}: {e}")
+            return {"id": text_id, "content": "", "error": str(e), "report": text}
 
-    # Save results
-    date = datetime.now().strftime("%m%d")
-    output_folder = os.path.join(output_root, "recurrence_task", model_name, prompt_version, str(patient_id))
-    os.makedirs(output_folder, exist_ok=True)
-    output_file = os.path.join(output_folder, "output.json")
-    with open(output_file, 'w') as f:
-        json.dump(recurrence_results, f, indent=2, default=str)
+
+    async def process_all_texts(self, texts: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """Process all texts concurrently"""
+        semaphore = asyncio.Semaphore(3)  # Limit concurrent requests
+
+        async def process_with_semaphore(session, text_data):
+            async with semaphore:
+                return await self.process_text(
+                    session, 
+                    text_data["text"], 
+                    text_data["id"], 
+                    text_data.get("report_description"),
+                    text_data.get("note_date")
+                )
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [process_with_semaphore(session, text_data) for text_data in texts]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+def postprocess_grammar(results, debug=False):
+    """
+    Mirror the original postprocess_grammar function exactly
+    """
+    print("POSTPROCESSING")
     
-    print(f"Saved patient {patient_id} output to {output_file}")
-    return recurrence_results
-
-
-async def process_patient_parallel(
-    patient_id: str, 
-    data_dir: str, 
-    prompts_file: str, 
-    prompt_version: str,
-    patient_meta: pd.DataFrame, 
-    output_root: str, 
-    max_vis_reports: int = None, 
-    max_concurrent: int = 4,
-    model_name: str = "Qwen3-Instruct",
-    llamacpp_port: int = 8080
-):
-    """Process VIS reports in parallel batches (for GPU with --parallel > 1)."""
-    print(f"patient_id: {patient_id}")
+    extracted_data = []
+    error_count = 0
     
-    # Get patient metadata
-    patient_row = patient_meta[patient_meta["EMPI"] == str(patient_id)]
-    if patient_row.empty:
-        print(f"ERROR: Patient {patient_id} not found in patient_meta!")
+    # Create a dictionary format similar to original
+    result = {}
+    for r in results:
+        if isinstance(r, Exception) or r.get('error'):
+            continue
+        result[r['id']] = {
+            'content': r.get('content', ''),
+            'report': r.get('report', '')  # We'll need to add this
+        }
+    
+    # Iterate over each report and its associated data
+    for i, (id, info) in enumerate(result.items()):
+        print(f"Processing report {i+1} of {len(result)}")
+        
+        # Extract the content of the first field
+        content = info["content"]
+        
+        # Parse the content string into a dictionary
+        try:
+            # Clean up content
+            if content.endswith("<|eot_id|>"):
+                content = content[: -len("<|eot_id|>")]
+            if content.endswith("</s>"):
+                content = content[: -len("</s>")]
+            
+            # Extract all JSON objects from the content
+            json_objects = []
+            # Find all {...} patterns
+            brace_count = 0
+            start_idx = -1
+            
+            for idx, char in enumerate(content):
+                if char == '{':
+                    if brace_count == 0:
+                        start_idx = idx
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        # Found a complete JSON object
+                        json_str = content[start_idx:idx+1]
+                        json_objects.append(json_str)
+                        start_idx = -1
+            
+            print(f"Found {len(json_objects)} JSON object(s) in output")
+            
+            # Use the last JSON object if available
+            if json_objects:
+                content = json_objects[-1]
+                print(f"Using last JSON object for parsing")
+            
+            # Clean the selected JSON string
+            content = content.replace("\n","")
+            content = content.replace("\r","")
+            content = content.replace("\\", "")
+            content = re.sub(r',\s*}', '}', content) # remove trailing comma
+            
+            try:
+                info_dict_raw = json.loads(content)
+            except Exception:
+                try:
+                    content = content.replace(" null,", '').replace(' "null",', "")
+                    info_dict_raw = json.loads(content)
+                except Exception as e:
+                    print(f"Failed to parse LLM output. Did you set --n_predict too low or is the input too long? Maybe you can try to lower the temperature a little. ({content=})", flush=True)
+                    print("RAW LLM OUTPUT: '" + info["content"] + "'", flush=True)
+                    print("Error:", e, flush=True)
+                    print("TRACEBACK:", traceback.format_exc(), flush=True)
+                    info_dict_raw = {}
+                    error_count += 1
+            
+            info_dict = {}
+            for key, value in info_dict_raw.items():
+                if is_empty_string_nan_or_none(value):
+                    info_dict[key] = ""
+                elif isinstance(value, (list, dict)):
+                    # Convert lists and dicts to JSON strings
+                    info_dict[key] = json.dumps(value)
+                else:
+                    info_dict[key] = str(value)
+                    
+        except Exception as e:
+            print(f"Failed to parse LLM output. Did you set --n_predict too low or is the input too long? Maybe you can try to lower the temperature a little. (Output: {content=})", flush=True)
+            print("Error:", e, flush=True)
+            print("TRACEBACK:", traceback.format_exc(), flush=True)
+            print(f"Will ignore the error for report {i} and continue.", flush=True)
+            info_dict = {}
+            error_count += 1
+        
+        # Create basic metadata (simplified since we don't have all the original metadata)
+        metadata = {
+            "processing_date": datetime.now().isoformat(),
+            "model": "llmaix",  # or use actual model name
+            "llm_processing": {
+                "temperature": 0.0,  # Use actual values from processor
+                "model": "llmaix"
+            }
+        }
+        
+        # Construct a dictionary containing the report and extracted information
+        extracted_info = {
+            # "report": info["report"],
+            "id": id,
+            "metadata": json.dumps(metadata),
+        }
+        for key, value in info_dict.items():
+            extracted_info[key] = value
+        
+        # Append the extracted information to the list
+        extracted_data.append(extracted_info)
+    
+    # Convert the list of dictionaries into a DataFrame
+    df = pd.DataFrame(extracted_data)
+    return df, error_count
+
+def load_config(config_path: str) -> dict:
+    """Load YAML configuration file"""
+    if not os.path.exists(config_path):
+        print(f"Warning: Config file {config_path} not found")
+        return {"models": []}
+
+    with open(config_path, 'r') as file:
+        return yaml.safe_load(file)
+    
+def load_prompts_config(prompts_file: str) -> dict:
+    """Load prompts configuration from YAML file"""
+    if not os.path.exists(prompts_file):
+        print(f"Warning: Prompts file {prompts_file} not found, using defaults")
+        return {
+            'system_prompt': 'You are a helpful assistant.',
+            'user_prompt': 'Extract information from the following text:\n\n{report}',
+            'grammar': ''
+        }
+    
+    with open(prompts_file, 'r', encoding='utf-8') as file:
+        config = yaml.safe_load(file)
+    
+    return {
+        'system_prompt': config.get('system_prompt', 'You are a helpful assistant.'),
+        'user_prompt': config.get('user_prompt', 'Extract information from the following text:\n\n{report}'),
+        'grammar': config.get('grammar', '')
+    }
+
+
+def read_text_files(input_dir: str) -> List[Dict[str, str]]:
+    """Read all .txt files from input directory"""
+    txt_files = glob.glob(os.path.join(input_dir, "*.txt"))
+    texts = []
+
+    for txt_file in txt_files:
+        try:
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            file_id = os.path.splitext(os.path.basename(txt_file))[0]
+            texts.append({
+                "id": file_id,
+                "text": content,
+                "filename": txt_file
+            })
+        except Exception as e:
+            print(f"Error reading {txt_file}: {e}")
+
+    return texts
+
+def write_full_history(input_dir: str): 
+    """combine all RAD reports to one report """
+    txt_files = glob.glob(os.path.join(input_dir, "*.txt"))
+    full_history = ""
+
+    for i, txt_file in enumerate(txt_files):
+        if i < 30: 
+            try:
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    full_history += f"\n\n--- Report: {i+1} Date: {i} ---\n\n{content}"
+            except Exception as e:
+                print(f"Error reading {txt_file}: {e}")
+
+    return full_history
+
+def save_results_to_csv(results: List[Dict[str, Any]], output_file: str):
+    """Save processing results to CSV file"""
+    # Process results to handle exceptions
+    processed_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            processed_results.append({
+                "id": "error",
+                "content": "",
+                "error": str(result)
+            })
+        else:
+            processed_results.append(result)
+
+    df = pd.DataFrame(processed_results)
+
+    # Add metadata
+    df["processing_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    df.to_csv(output_file, index=False)
+    print(f"Results saved to: {output_file}")
+
+def extract_content(res, modality):
+    
+    """
+    Extract structured information from model response.
+    Handles both new structured format and fallback parsing.
+    """
+    try:
+        content = res.get('content', '')
+        if isinstance(content, dict):
+            parsed = content
+        elif isinstance(content, str):
+            # Remove markdown code blocks if present
+            content_clean = content.strip()
+            if content_clean.startswith('```json'):
+                content_clean = content_clean.split('```json', 1)[1]
+            if content_clean.startswith('```'):
+                content_clean = content_clean.split('```', 1)[1]
+            if content_clean.endswith('```'):
+                content_clean = content_clean.rsplit('```', 1)[0]
+            
+            content_clean = content_clean.strip()
+            
+            
+            try:
+                parsed = json.loads(content_clean)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract JSON from text
+                import re
+                json_match = re.search(r'\{.*\}', content_clean, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                else:
+                    print(f"WARNING: Could not parse JSON from content")
+                    return None
+        else:
+            parsed = content
+        
+        # Handle if parsed is a list (array) - extract the first element
+        if isinstance(parsed, list):
+            if len(parsed) == 0:
+                print(f"WARNING: Parsed JSON is an empty array for {res.get('id', 'unknown')}")
+                return None
+            # Use the first element if it's an array
+            parsed = parsed[0]
+            print(f"✓ Extracted first element from JSON array")
+        
+        # Extract fields from new structured format
+        if modality == 'VIS':
+            event = {
+                'patient_id': res.get('id', 'unknown'),
+                'reasoning': parsed.get('reasoning', ''),
+                'surgeries': parsed.get('surgeries', []),
+                'surgery_count': parsed.get('surgery_count', 0),
+                'diagnoses': parsed.get('diagnoses', []),
+                'diagnosis_count': parsed.get('diagnosis_count', 0),
+                'raw_content': content  # Keep raw content for debugging
+            }
+            
+            return event
+        elif modality == 'OPN':
+            event = {
+                'patient_id': res.get('id', 'unknown'),
+                'lung_chest_surgery': parsed.get('lung_chest_surgery', False),
+                'reasoning': parsed.get('reasoning', ''),
+                'procedure_type': parsed.get('procedure_type', ''),
+                'date': parsed.get('date', ''),
+                'evidence_snippet': parsed.get('evidence_snippet', ''),
+                'confidence': parsed.get('confidence', ''),
+                'raw_content': content  # Keep raw content for debugging
+            }
+            return event
+        else:
+            print(f"Modality {modality} not supported yet.")
+            return None
+
+    except Exception as e:
+        print(f"ERROR in extract_content: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return None
-    
-    first_surgery_date = patient_row['indexSurgery'].iloc[0]
-    if pd.isna(first_surgery_date) or not first_surgery_date:
-        print(f"Missing first lung surgery date for patient {patient_id}")
-        return None
 
-    vis_reports = extract_single_reports(data_dir, patient_id, 'VIS')
-    if not vis_reports:
-        print(f"No VIS reports found for patient {patient_id}")
-        return None
-    if max_vis_reports:
-        vis_reports = vis_reports[:max_vis_reports]
+
+async def main():
+    parser = argparse.ArgumentParser(description='Process text files with LLM')
     
-    print(f"Processing {len(vis_reports)} VIS reports in batches of {max_concurrent}")
+    # Input/output arguments
+    parser.add_argument('--input_dir', default=f'/vast/florian/carlotta/data/timeline_ds_STS', help='Directory containing .txt files to process') # data/auxiliary_task_reports/{patient_id}
+    parser.add_argument('--patient_id_file', default='patient_ids.yaml', help='YAML file containing patient ID')
+    # Model arguments
+    parser.add_argument('--model_name', '-m', required=True, 
+                       help='Model filename or API model name')
+    parser.add_argument('--chat_endpoint', action='store_true', 
+                       help='Use chat endpoint instead of completion')
+    # default is False
+    parser.add_argument('--api_model', action='store_true', 
+                       help='Use OpenAI-compatible API instead of local model')
+
+    # LLM parameters
+    parser.add_argument('--temperature', '-t', type=float, default=0.1,
+                       help='Temperature (0.0-1.0)')
+    parser.add_argument('--n_predict', '-n', type=int, default=512,
+                       help='Maximum tokens to predict')
+    parser.add_argument('--top_k', type=int, default=30, help='Top-k sampling')
+    parser.add_argument('--top_p', type=float, default=0.9, help='Top-p sampling')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+
+    # Grammar and schema
+    parser.add_argument('--prompts-file', default='./prompts/event_extraction_OPN.yaml', 
+                   help='YAML file containing prompts and grammar (default: prompts.yaml)')
+
+    parser.add_argument('--json_schema', help='JSON schema for structured output')
+
+    parser.add_argument('--config_file', default='models/config.yml',
+                       help='Model configuration file')
+    parser.add_argument('--llamacpp_port', type=int, default=8080,
+                       help='llama.cpp server port')
+    parser.add_argument('--debug', action='store_true', 
+                       help='Enable debug output')
     
-    # Load prompts config once
-    prompts_config = load_prompts_config(prompts_file)
+    parser.add_argument('--per_report', action='store_true', 
+                       help='Process each report separately instead of combining into full history')
+    parser.add_argument('--modality', type=str, default='VIS', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
+    args = parser.parse_args()
+
+    prompts_config = load_prompts_config(args.prompts_file)
+
+    
     system_prompt = prompts_config['system_prompt']
-    user_prompt_template = prompts_config['user_prompt']
-    
-    async def process_single_vis(vis_report):
-        """Process a single VIS report"""
-        vis_date = vis_report['note_date']
-        vis_text = vis_report['text']
-        
-        user_prompt = user_prompt_template.format(
-            first_lung_surgery_date=first_surgery_date,
-            vis_note_text=vis_text
-        )
-        
+    user_prompt = prompts_config['user_prompt']
+    grammar = prompts_config['grammar']
+    num_text = 3
+    print(f"Modality: {args.modality}")
+    # get patient_id from yaml file
+    if not os.path.exists(args.patient_id_file):
+        print(f"Error: Patient ID file {args.patient_id_file} not found")
+        return 1
+
+    with open(args.patient_id_file, 'r') as f:
+        data = yaml.safe_load(f)
+        patient_ids = data["patient_id"]
+
+    raw_dir = f"outputs/{args.model_name}"
+    OUTPUT_FILE = 'outputs/all_model_results.json'
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    summary = []
+    successful = 0
+    failed = 0
+    # loop all the below logics for each patient_id
+    for patient_id in patient_ids:
+        events = []
+        print(f"Processing patient ID: {patient_id}")
+        # Validate input directory
+        if not os.path.isdir(args.input_dir):
+            print(f"Error: Input directory {args.input_dir} does not exist")
+            return 1
+
+        # Read text files
+        if args.per_report:
+            print(f"Analysing text files from: {args.input_dir} seperately")
+            texts = extract_single_reports(args.input_dir, patient_id, args.modality)
+
+            if not texts:
+                print("No .txt files found in input directory")
+                return 1
+            if num_text > len(texts):
+                texts = texts[:num_text]
+
+            print(f"Found {len(texts)} text files to process")
+        else: 
+            # full history 
+            print(f"Combining all text files from: {args.input_dir} into one history")
+            
+            full_history = extract_mod_reports(args.input_dir, patient_id, args.modality)
+            os.makedirs(f"../../data/{args.modality}/", exist_ok=True)
+            # save full history to a text file
+            with open(f"../../data/{args.modality}/full_history_{patient_id}.txt", "w", encoding="utf-8") as f:
+                f.write(full_history)
+
+            texts = [{"id": "full_history", "text": full_history, "filename": f"full_history_{patient_id}_{args.modality}.txt"}]
+
+        # Initialize processor
         processor = TextProcessor(
-            model_name=model_name,
-            api_model=False,
+            model_name=args.model_name,
+            api_model=args.api_model,
             prompt=user_prompt,
             system_prompt=system_prompt,
-            temperature=0.1,
-            grammar="",
-            n_predict=4096,
-            chat_endpoint=True,
-            debug=False,
-            llamacpp_port=llamacpp_port
+            temperature=args.temperature,
+            grammar=grammar or "",
+            json_schema=args.json_schema or "",
+            n_predict=args.n_predict,
+            chat_endpoint=args.chat_endpoint,
+            debug=args.debug,
+            llamacpp_port=args.llamacpp_port,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            seed=args.seed
         )
+
+        print(f"Processing texts with model: {args.model_name}")
+        print(f"Using {'chat' if args.chat_endpoint else 'completion'} endpoint")
+        print(f"Using {'API' if args.api_model else 'local'} model")
+
+        # Process input
+        start_time = time.time()
         
-        texts = [{"id": vis_report['id'], "text": vis_text}]
-        try:
-            results = await processor.process_all_texts(texts)
-            output_json = None
-            if results and results[0] and not results[0].get('error'):
-                result = results[0]
-                content = result.get('content', '')
-                if '```json' in content:
-                    content = content.split('```json')[-1].split('```')[0]
-                try:
-                    output_json = json.loads(content)
-                except Exception as e:
-                    print(f"Failed to parse JSON for {patient_id} VIS {vis_report['id']}: {e}")
-            
-            return {
-                "vis_id": vis_report['id'],
-                "vis_date": vis_date,
-                "surgery_date": str(first_surgery_date),
-                "output": output_json if output_json else {"error": True}
-            }
-        except Exception as e:
-            print(f"Exception for {patient_id} VIS {vis_report['id']}: {e}")
-            return {
-                "vis_id": vis_report['id'],
-                "vis_date": vis_date,
-                "surgery_date": str(first_surgery_date),
-                "output": {"error": str(e)}
-            }
-    
-    # Process VIS reports in parallel batches
-    recurrence_results = []
-    for i in range(0, len(vis_reports), max_concurrent):
-        batch = vis_reports[i:i + max_concurrent]
-        print(f"  Processing VIS batch {i//max_concurrent + 1}/{(len(vis_reports)-1)//max_concurrent + 1} ({len(batch)} reports)")
+        result = await processor.process_all_texts(texts)
+        end_time = time.time()
         
-        # Process batch concurrently
-        batch_results = await asyncio.gather(*[process_single_vis(vis) for vis in batch])
-        recurrence_results.extend(batch_results)
-    
-    # Save results
-    date = "1031" # datetime.now().strftime("%m%d")
-    output_folder = os.path.join(output_root, "recurrence_task", model_name, prompt_version, str(patient_id))
-    os.makedirs(output_folder, exist_ok=True)
-    output_file = os.path.join(output_folder, "output.json")
-    with open(output_file, 'w') as f:
-        json.dump(recurrence_results, f, indent=2, default=str)
-    
-    print(f"Saved patient {patient_id} output to {output_file}")
-    return recurrence_results
+        print(f"Processing completed in {end_time - start_time:.2f} seconds")
 
+        # Save raw model output to text file
+        raw_output_file = os.path.join(raw_dir, f"{args.modality}/raw_output_{patient_id}.txt")
+        with open(raw_output_file, 'w', encoding='utf-8') as f:
+            f.write(f"Raw Model Output for Patient {patient_id}\n")
+            f.write("="*80 + "\n\n")
+            for res in result:
+                if isinstance(res, Exception):
+                    f.write(f"ERROR: {str(res)}\n\n")
+                else:
+                    f.write(f"ID: {res.get('id', 'unknown')}\n")
+                    f.write("-"*80 + "\n")
+                    f.write(f"CONTENT:\n{res.get('content', '')}\n")
+                    f.write("="*80 + "\n\n")
+        print(f"Raw model output saved to: {raw_output_file}")
 
-async def clear_kv_cache(llamacpp_port: int = 8080):
-    """Clear the KV cache by sending a request to the llama.cpp server"""
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"http://localhost:{llamacpp_port}/v1/chat/completions"
-            payload = {
-                "messages": [{"role": "user", "content": "clear"}],
-                "max_tokens": 1,
-                "cache_prompt": False
-            }
-            async with session.post(url, json=payload) as response:
-                await response.json()
-        print("KV cache cleared")
-    except Exception as e:
-        print(f"Warning: Could not clear KV cache: {e}")
+        for res in result:
+            if isinstance(res, Exception):
+                continue
+                
+            if isinstance(res, dict) and 'content' in res and not res.get('error'):
+                event = extract_content(res, args.modality)
+                if event:
+                    events.append(event)
+            elif isinstance(res, list):
+                # handle nested event lists
+                for ev in res:
+                    if isinstance(ev, dict) and 'content' in ev and not ev.get('error'):
+                        event = extract_content(ev, args.modality)
+                        if event:
+                            events.append(event)
 
+        # Update success/failure tracking                    
+        if any(not isinstance(res, Exception) and not res.get('error') for res in result):
+            successful += 1
+        else:
+            failed += 1
 
-async def main(args):
-    """Main processing function"""
-    
-    # Load patient metadata
-    print(f"Loading patient metadata from: {args.groundtruth}")
-    patient_meta = pd.read_csv(args.groundtruth)
-    patient_meta['EMPI'] = patient_meta['EMPI'].astype(str)
-    
-    # Get patient IDs to process
-    if args.patient_ids:
-        patient_ids = [str(pid) for pid in args.patient_ids]
-        print(f"Processing {len(patient_ids)} specified patients")
+        # Enhanced summary with new fields
+        summary.append({
+            "task": "event_extraction_report",
+            "model": args.model_name,
+            "patient_id": patient_id,
+            "total_surgeries": sum(e.get('surgery_count', 0) for e in events),
+            "total_diagnoses": sum(e.get('diagnosis_count', 0) for e in events),
+            "events_extracted": events
+        })
+
+    with open(f"outputs/summary_{args.model_name}.json", "w") as fsum:
+        json.dump(summary, fsum, indent=2)
+
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r") as f:
+            all_results = json.load(f)
     else:
-        patient_ids = patient_meta["EMPI"].astype(str).tolist()
-        print(f"Processing all {len(patient_ids)} patients")
-    
-    if args.skip_existing:
-        original_count = len(patient_ids)
-        patient_ids_to_process = []
-        already_processed = []
-        
-        for pid in patient_ids:
-            # add date to outputs
-            date = "1031" #datetime.now().strftime("%m%d")
-            output_file = os.path.join(args.output, f"recurrence_task", args.model, args.prompt_version, str(pid), f"output.json")
-            print(f"output file path: {output_file}")
-            if os.path.exists(output_file):
-                already_processed.append(pid)
-            else:
-                patient_ids_to_process.append(pid)
-        
-        patient_ids = patient_ids_to_process
-        print(f"Found {len(already_processed)} already processed patients (skipping)")
-        print(f"Remaining patients to process: {len(patient_ids)}")
-        
-        if len(already_processed) > 0:
-            print(f"Already processed: {already_processed[:5]}{'...' if len(already_processed) > 5 else ''}")
-    else:
-        print(f"Note: Use --skip-existing to skip already processed patients")
-    
-    
-    # Determine processing mode
-    use_parallel = args.parallel > 1
-    
-    print(f"\nConfiguration:")
-    print(f"  Model: {args.model}")
-    print(f"  Data dir: {args.data_dir}")
-    print(f"  Prompts: {args.prompts}")
-    print(f"  Output: {args.output}")
-    print(f"  Max VIS reports: {args.max_vis}")
-    print(f"  Processing mode: {'Parallel' if use_parallel else 'Sequential'}")
-    if use_parallel:
-        print(f"  Parallel slots: {args.parallel}")
-    print(f"  LlamaCPP port: {args.port}")
-    print()
-    
-    # Process patients
-    start_time = datetime.now()
-    
-    for i, patient_id in enumerate(patient_ids):
-        print(f"\n{'='*60}")
-        print(f"Processing patient {i+1}/{len(patient_ids)}: {patient_id}")
-        print(f"{'='*60}\n")
-        
-        try:
-            if use_parallel:
-                await process_patient_parallel(
-                    patient_id=patient_id,
-                    data_dir=args.data_dir,
-                    prompts_file=args.prompts,
-                    prompt_version=args.prompt_version,
-                    patient_meta=patient_meta,
-                    output_root=args.output,
-                    max_vis_reports=args.max_vis,
-                    max_concurrent=args.parallel,
-                    model_name=args.model,
-                    llamacpp_port=args.port
-                )
-            else:
-                await process_patient_recurrence_task(
-                    patient_id=patient_id,
-                    data_dir=args.data_dir,
-                    prompts_file=args.prompts,
-                    prompt_version=args.prompt_version,
-                    patient_meta=patient_meta,
-                    output_root=args.output,
-                    max_vis_reports=args.max_vis,
-                    model_name=args.model,
-                    llamacpp_port=args.port
-                )
-        except Exception as e:
-            print(f"❌ ERROR processing patient {patient_id}: {e}")
-            print(f"Continuing with next patient...\n")
-            continue
-        
-        # Clear KV cache periodically
-        cache_interval = 10 if use_parallel else 5
-        if (i + 1) % cache_interval == 0:
-            print(f"\n--- Clearing KV cache after patient {i+1} ---")
-            await clear_kv_cache(llamacpp_port=args.port)
-            await asyncio.sleep(0.5 if use_parallel else 1)
-    
-    # Summary
-    elapsed = datetime.now() - start_time
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"Total patients: {len(patient_ids)}")
-    print(f"Total time: {elapsed}")
-    print(f"Average per patient: {elapsed / len(patient_ids)}")
-    print(f"{'='*60}\n")
+        all_results = []
 
+    all_results.extend(summary)
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description="Extract recurrence events from VIS notes using LLM",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-            Examples:
-            # Sequential processing (Mac/single slot)
-            python main_parallel.py --model Qwen3-Instruct --max-vis 300
-            
-            # Parallel processing (A100 with --parallel 4)
-            python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300 --skip-existing
-            
-            # Skip already processed patients
-            python main_parallel.py --model Qwen3-Instruct --skip-existing
-  
-            # Process specific patients
-            python main_parallel.py --model Qwen3-Instruct --patient-ids 104352354 107373506
-                    """
-                )
-    
-    # Required arguments
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Model name (e.g., Qwen3-Instruct, Llama-3.1-8B)"
-    )
-    
-    # Optional arguments
-    parser.add_argument(
-        "--data-dir",
-        type=str,
-        default="/vast/florian/carlotta/data/timeline_ds_STS",
-        help="Path to patient data directory (default: %(default)s)"
-    )
-    
-    parser.add_argument(
-        "--prompts",
-        type=str,
-        default=f"/vast/florian/carlotta/LLMAIx/rec_task/recurrence_prompt.yaml",
-        help="Path to prompts YAML file (default: %(default)s)"
-    )
-    
-    parser.add_argument(
-        "--groundtruth",
-        type=str,
-        default="/vast/florian/carlotta/data/groundtruth_recurrence.csv",
-        help="Path to ground truth CSV with patient metadata (default: %(default)s)"
-    )
-    
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="./outputs",
-        help="Output directory for results (default: %(default)s)"
-    )
-    
-    parser.add_argument(
-        "--max-vis",
-        type=int,
-        default=300,
-        help="Maximum VIS reports to process per patient (default: all)"
-    )
-    
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=1,
-        help="Number of parallel slots (should match llama-server --parallel, default: 1)"
-    )
-    
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="LlamaCPP server port (default: 8080)"
-    )
-    
-    parser.add_argument(
-        "--patient-ids",
-        type=str,
-        nargs='+',
-        default=None,
-        help="Specific patient IDs to process (default: all patients)"
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action='store_true',
-        help="Skip patients that already have output files"
-    )
-    parser.add_argument(
-        "--prompt_version",
-        type=str,
-        default=datetime.now().strftime("%m%d"),
-        help="Version of the prompt used (default: %(default)s)"
-    )
-    
-    return parser.parse_args()
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(all_results, f, indent=2)
+        # Save results
+        # df, error_count = postprocess_grammar(result, debug=args.debug)
+        
+        # Save the processed DataFrame
+        # df.to_csv(f"results/resultsfullhistory{patient_id}.csv", index=False)
+
+        
+    # Print summary
+    # successful = sum(1 for r in result if not isinstance(r, Exception) and not r.get("error"))
+    # failed = len(result) - successful
+
+    print(f"\nSummary:")
+    print(f"- Total files: {len(patient_ids)}")
+    print(f"- Successful: {successful}")
+    print(f"- Failed: {failed}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    args = parse_arguments()
-    asyncio.run(main(args))
+    try:
+        exit_code = asyncio.run(main())
+        exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nProcessing interrupted by user")
+        exit(1)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        if "--debug" in os.sys.argv:
+            traceback.print_exc()
+        exit(1)
