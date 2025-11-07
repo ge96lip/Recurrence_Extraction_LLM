@@ -18,12 +18,16 @@ Examples:
 
 import argparse
 import asyncio
+from asyncio.log import logger
 import json
 import os
 import sys
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Add local_process to path
 sys.path.append('/vast/florian/carlotta/LLMAIx/local_process')
@@ -44,25 +48,25 @@ async def process_patient_recurrence_task(
     llamacpp_port: int = 8080
 ):
     """Process each VIS report for recurrence extraction (sequential)."""
-    print(f"patient_id: {patient_id}")
+    logger.info("Processing patient_id: %s", patient_id)
     
     # Get patient metadata
     patient_row = patient_meta[patient_meta["EMPI"] == str(patient_id)]
     
     if patient_row.empty:
-        print(f"ERROR: Patient {patient_id} not found in patient_meta!")
+        logger.error("Patient %s not found in patient_meta!", patient_id)
         return None
     
     first_surgery_date = patient_row['indexSurgery'].iloc[0]
-    print(f"first_surgery_date: {first_surgery_date}")
-    
+    logger.info("first_surgery_date: %s", first_surgery_date)
+
     if pd.isna(first_surgery_date) or not first_surgery_date:
-        print(f"Missing first lung surgery date for patient {patient_id}")
+        logger.error("Missing first lung surgery date for patient %s", patient_id)
         return None
 
     vis_reports = extract_single_reports(data_dir, patient_id, 'VIS')
     if not vis_reports:
-        print(f"No VIS reports found for patient {patient_id}")
+        logger.error("No VIS reports found for patient %s", patient_id)
         return None
     if max_vis_reports:
         vis_reports = vis_reports[:max_vis_reports]
@@ -88,8 +92,8 @@ async def process_patient_recurrence_task(
     recurrence_results = []
     for i, vis_report in enumerate(vis_reports):
         if i % 10 == 0:
-            print(f"  Processing VIS report {i+1}/{len(vis_reports)} for patient {patient_id}")
-        
+            logger.info("Processing VIS report %d/%d for patient %s", i+1, len(vis_reports), patient_id)
+
         vis_date = vis_report['note_date']
         vis_text = vis_report['text']
         
@@ -111,10 +115,10 @@ async def process_patient_recurrence_task(
                 try:
                     output_json = json.loads(content)
                 except Exception as e:
-                    print(f"Failed to parse JSON for {patient_id} VIS {vis_report['id']}: {e}")
+                    logger.error("Failed to parse JSON for %s VIS %s: %s", patient_id, vis_report['id'], e)
             else:
-                print(f"Model error for {patient_id} VIS {vis_report['id']}")
-            
+                logger.error("Model error for %s VIS %s", patient_id, vis_report['id'])
+
             result_entry = {
                 "vis_id": vis_report['id'],
                 "vis_date": vis_date,
@@ -123,7 +127,7 @@ async def process_patient_recurrence_task(
             }
             recurrence_results.append(result_entry)
         except Exception as e:
-            print(f"Exception for {patient_id} VIS {vis_report['id']}: {e}")
+            logger.error("Exception for %s VIS %s: %s", patient_id, vis_report['id'], e)
 
     # Save results
     date = datetime.now().strftime("%m%d")
@@ -132,8 +136,8 @@ async def process_patient_recurrence_task(
     output_file = os.path.join(output_folder, "output.json")
     with open(output_file, 'w') as f:
         json.dump(recurrence_results, f, indent=2, default=str)
-    
-    print(f"Saved patient {patient_id} output to {output_file}")
+
+    logger.info("Saved patient %s output to %s", patient_id, output_file)
     return recurrence_results
 
 
@@ -150,27 +154,27 @@ async def process_patient_parallel(
     llamacpp_port: int = 8080
 ):
     """Process VIS reports in parallel batches (for GPU with --parallel > 1)."""
-    print(f"patient_id: {patient_id}")
-    
+    logger.info("Processing patient_id: %s", patient_id)
+
     # Get patient metadata
     patient_row = patient_meta[patient_meta["EMPI"] == str(patient_id)]
     if patient_row.empty:
-        print(f"ERROR: Patient {patient_id} not found in patient_meta!")
+        logger.error("Patient %s not found in patient_meta!", patient_id)
         return None
     
     first_surgery_date = patient_row['indexSurgery'].iloc[0]
     if pd.isna(first_surgery_date) or not first_surgery_date:
-        print(f"Missing first lung surgery date for patient {patient_id}")
+        logger.error("Missing first lung surgery date for patient %s", patient_id)
         return None
 
     vis_reports = extract_single_reports(data_dir, patient_id, 'VIS')
     if not vis_reports:
-        print(f"No VIS reports found for patient {patient_id}")
+        logger.error("No VIS reports found for patient %s", patient_id)
         return None
     if max_vis_reports:
         vis_reports = vis_reports[:max_vis_reports]
-    
-    print(f"Processing {len(vis_reports)} VIS reports in batches of {max_concurrent}")
+
+    logger.info("Processing %d VIS reports in batches of %d", len(vis_reports), max_concurrent)
     
     # Load prompts config once
     prompts_config = load_prompts_config(prompts_file)
@@ -212,8 +216,8 @@ async def process_patient_parallel(
                 try:
                     output_json = json.loads(content)
                 except Exception as e:
-                    print(f"Failed to parse JSON for {patient_id} VIS {vis_report['id']}: {e}")
-            
+                    logger.error("Failed to parse JSON for %s VIS %s: %s", patient_id, vis_report['id'], e)
+
             return {
                 "vis_id": vis_report['id'],
                 "vis_date": vis_date,
@@ -221,7 +225,7 @@ async def process_patient_parallel(
                 "output": output_json if output_json else {"error": True}
             }
         except Exception as e:
-            print(f"Exception for {patient_id} VIS {vis_report['id']}: {e}")
+            logger.error("Exception for %s VIS %s: %s", patient_id, vis_report['id'], e)
             return {
                 "vis_id": vis_report['id'],
                 "vis_date": vis_date,
@@ -233,7 +237,7 @@ async def process_patient_parallel(
     recurrence_results = []
     for i in range(0, len(vis_reports), max_concurrent):
         batch = vis_reports[i:i + max_concurrent]
-        print(f"  Processing VIS batch {i//max_concurrent + 1}/{(len(vis_reports)-1)//max_concurrent + 1} ({len(batch)} reports)")
+        logger.info("Processing VIS batch %d/%d (%d reports)", i//max_concurrent + 1, (len(vis_reports)-1)//max_concurrent + 1, len(batch))
         
         # Process batch concurrently
         batch_results = await asyncio.gather(*[process_single_vis(vis) for vis in batch])
@@ -246,8 +250,8 @@ async def process_patient_parallel(
     output_file = os.path.join(output_folder, "output.json")
     with open(output_file, 'w') as f:
         json.dump(recurrence_results, f, indent=2, default=str)
-    
-    print(f"Saved patient {patient_id} output to {output_file}")
+
+    logger.info("Saved patient %s output to %s", patient_id, output_file)
     return recurrence_results
 
 
@@ -273,18 +277,39 @@ async def main(args):
     """Main processing function"""
     
     # Load patient metadata
-    print(f"Loading patient metadata from: {args.groundtruth}")
+    patient_meta = pd.read_csv(args.groundtruth)
+    patient_meta['EMPI'] = patient_meta['EMPI'].astype(str)
+
+    # --- logging setup: write logs to outputs/logs/... and to console ---
+    log_dir = Path(args.output) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"main_parallel_{args.model}_{args.prompt_version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    handlers = [logging.FileHandler(log_file), logging.StreamHandler()]
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", handlers=handlers)
+
+    # Catch unhandled exceptions and log them
+    def _handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    sys.excepthook = _handle_exception
+    logger.info("Started run — model=%s prompt_version=%s", args.model, args.prompt_version)
+    logger.info("Log file: %s", str(log_file))
+
+    logger.info("Loading patient metadata from: %s", args.groundtruth)
+
     patient_meta = pd.read_csv(args.groundtruth)
     patient_meta['EMPI'] = patient_meta['EMPI'].astype(str)
     
     # Get patient IDs to process
     if args.patient_ids:
         patient_ids = [str(pid) for pid in args.patient_ids]
-        print(f"Processing {len(patient_ids)} specified patients")
+        logger.info("Processing %d specified patients", len(patient_ids))
     else:
         patient_ids = patient_meta["EMPI"].astype(str).tolist()
-        print(f"Processing all {len(patient_ids)} patients")
-    
+        logger.info("Processing all %d patients", len(patient_ids))    
+
     if args.skip_existing:
         original_count = len(patient_ids)
         patient_ids_to_process = []
@@ -294,36 +319,37 @@ async def main(args):
             # add date to outputs
             date = "1031" #datetime.now().strftime("%m%d")
             output_file = os.path.join(args.output, f"recurrence_task", args.model, args.prompt_version, str(pid), f"output.json")
-            print(f"output file path: {output_file}")
+            logger.debug("output file path: %s", output_file)
+
             if os.path.exists(output_file):
                 already_processed.append(pid)
             else:
                 patient_ids_to_process.append(pid)
         
         patient_ids = patient_ids_to_process
-        print(f"Found {len(already_processed)} already processed patients (skipping)")
-        print(f"Remaining patients to process: {len(patient_ids)}")
-        
+        logger.info("Found %d already processed patients (skipping)", len(already_processed))
+        logger.info("Remaining patients to process: %d", len(patient_ids))
+
         if len(already_processed) > 0:
-            print(f"Already processed: {already_processed[:5]}{'...' if len(already_processed) > 5 else ''}")
+            logger.info("Already processed: %s", already_processed[:5])
     else:
-        print(f"Note: Use --skip-existing to skip already processed patients")
-    
+        logger.info("Note: Use --skip-existing to skip already processed patients")
+
     
     # Determine processing mode
     use_parallel = args.parallel > 1
-    
-    print(f"\nConfiguration:")
-    print(f"  Model: {args.model}")
-    print(f"  Data dir: {args.data_dir}")
-    print(f"  Prompts: {args.prompts}")
-    print(f"  Output: {args.output}")
-    print(f"  Max VIS reports: {args.max_vis}")
-    print(f"  Processing mode: {'Parallel' if use_parallel else 'Sequential'}")
+
+    logger.info("Configuration:")
+    logger.info("  Model: %s", args.model)
+    logger.info("  Data dir: %s", args.data_dir)
+    logger.info("  Prompts: %s", args.prompts)
+    logger.info("  Output: %s", args.output)
+    logger.info("  Max VIS reports: %d", args.max_vis)
+    logger.info("  Processing mode: %s", 'Parallel' if use_parallel else 'Sequential')
     if use_parallel:
-        print(f"  Parallel slots: {args.parallel}")
-    print(f"  LlamaCPP port: {args.port}")
-    print()
+        logger.info("  Parallel slots: %d", args.parallel)
+    logger.info("  LlamaCPP port: %d", args.port)
+    logger.info("")
     
     # Process patients
     start_time = datetime.now()
@@ -331,9 +357,7 @@ async def main(args):
 
     async def _run_patient(pid):
         async with sem:
-            print(f"\n{'='*60}")
-            print(f"Processing patient: {pid}")
-            print(f"{'='*60}\n")
+            logger.info("Processing patient: %s", pid)
             try:
                 # keep per-patient processing sequential (no intra-patient parallelism)
                 await process_patient_recurrence_task(
@@ -348,7 +372,7 @@ async def main(args):
                     llamacpp_port=args.port
                 )
             except Exception as e:
-                print(f"❌ ERROR processing patient {pid}: {e}")
+                logger.error("ERROR processing patient %s: %s", pid, e)
             finally:
                 # clear KV cache occasionally to avoid growing context
                 # (do this per finished patient to spread the clearing)
@@ -363,12 +387,11 @@ async def main(args):
 
     # Summary
     elapsed = datetime.now() - start_time
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"Total patients: {len(patient_ids)}")
-    print(f"Total time: {elapsed}")
-    print(f"Average per patient: {elapsed / len(patient_ids)}")
-    print(f"{'='*60}\n")
+    logger.info("Processing complete!")
+    logger.info("Total patients: %d", len(patient_ids))
+    logger.info("Total time: %s", elapsed)
+    logger.info("Average per patient: %s", elapsed / len(patient_ids))
+    logger.info("%s", '='*60)
 
 
 def parse_arguments():
