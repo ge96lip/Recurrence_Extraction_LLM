@@ -3,17 +3,17 @@
 Recurrence Extraction Script for Lung Cancer VIS Notes
 
 Usage:
-    python run_recurrence_extraction.py --model Qwen3-Instruct [options]
-    
+    python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300 --prompts ./prompts/recurrence_prompt_1107.yaml --prompt_version 11073 --output ./outputs
+
 Examples:
     # Sequential processing (Mac/single slot)
-    python run_recurrence_extraction.py --model Qwen3-Instruct --max-vis 300
+    python main_parallel.py --model Qwen3-Instruct --max-vis 300
     
     # Parallel processing (A100 with --parallel 4)
-    python run_recurrence_extraction.py --model Qwen3-Instruct --parallel 4 --max-vis 300
+    python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300
     
     # Process specific patients only
-    python run_recurrence_extraction.py --model Qwen3-Instruct --patient-ids 104352354 107373506
+    python main_parallel.py --model Qwen3-Instruct --patient-ids 104352354 107373506
 """
 
 import argparse
