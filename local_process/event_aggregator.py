@@ -7,7 +7,8 @@ from datetime import date
 
 # --- Configuration ---
 # The base path where all patient folders are located
-BASE_DIR = f'/vast/florian/carlotta/LLMAIx/rec_task/outputs/recurrence_task/Qwen3-Instruct/1031/'   #{date.today().strftime("%m%d")}'
+VERSION = '11073'
+BASE_DIR = f''   #{date.today().strftime("%m%d")}'
 INPUT_FILENAME = 'output.json'
 OUTPUT_FILENAME = 'patient_level_events.csv' # Changed filename to reflect aggregation
 
@@ -59,7 +60,7 @@ def clean_date_to_month(date_str):
 
     if dt is None:
         # If all formats fail, print warning and return None
-        print(f"Warning: Could not parse date '{date_part}'. Skipping date.")
+        print(f"Warning: Could not parse date '{date_part}'. Writing empty CSV.")
         return None
     
     # Return the date in the required YYYY-MM format
@@ -194,6 +195,7 @@ def process_patient_data(patient_dir):
         event['Date extracted'] = ' | '.join(sorted(event['Date extracted']))
         event['Evidence Quote'] = ' | '.join(sorted(event['Evidence Quote']))
         event['VIS file'] = ' | '.join(sorted(event['VIS file']))
+        event['Reasoning'] = ' | '.join(sorted(event.get('Reasoning', [])))
         event['Certainty'] = ' | '.join(sorted(event['Certainty']))
 
     return final_events
@@ -203,14 +205,16 @@ def write_events_to_csv(patient_dir, events):
     output_path = os.path.join(patient_dir, OUTPUT_FILENAME)
     
     if not events:
-        print(f"No events to write for {os.path.basename(patient_dir)}. Skipping CSV creation.")
+        # empty CSV if no events
+        open(output_path, 'w').close()
+        print(f"No events to write for {os.path.basename(output_path)}. Skipping CSV creation.")
         return
 
-    fieldnames = ['Event Type', 'Event Date', 'Date extracted', 'Evidence Quote', 'VIS file', 'Certainty'] 
+    fieldnames = ['Event Type', 'Event Date', 'Date extracted', 'Evidence Quote', 'VIS file', 'Reasoning', 'Certainty']
 
     try:
         with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(events)
         print(f"Successfully wrote {len(events)} aggregated events to {output_path}")
@@ -235,6 +239,12 @@ def main():
 
     print("Aggregation complete.")
 
+def single_patient(patient_dir):
+    """Process a single patient directory for testing purposes."""
+    events = process_patient_data(patient_dir)
+    write_events_to_csv(patient_dir, events)
+
 if __name__ == '__main__':
     # NOTE: This script assumes the patient folders and JSON files exist in the BASE_DIR.
-    main()
+    #main()
+    single_patient(f'file_name')

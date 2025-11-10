@@ -90,7 +90,7 @@ def apply_event_priority(pred_df):
 # 1) Build PRED from per-patient CSVs
 # ----------------------------
 def build_pred():
-    base = Path("/vast/florian/carlotta/LLMAIx/rec_task/outputs/recurrence_task/Qwen3-Instruct/1031")
+    base = Path("")
     csv_paths = sorted(base.glob("*/patient_level_events.csv"))
 
     pred_rows = []
@@ -160,7 +160,7 @@ def build_pred():
 # 2) Build GT from your registry-like file
 # ----------------------------
 def build_gt(): 
-    path="/Users/carlotta/Desktop/Code_MT/data/aux_vis/GroundTruth/gt_automatic_eval.xlsx"
+    path="../GroundTruth/gt_automatic_eval.xlsx"
     gt_raw = pd.read_excel(path, dtype=str).rename(columns=lambda c: c.strip())
 
     # Normalize column names we rely on:
@@ -193,22 +193,43 @@ def build_gt():
         "NOREC": "NOREC"
     })
 
-    # Keep only REC and SUSP events (ground truth typically doesn't include NOREC)
-    gt = gt[gt["EVENT"].isin(["REC", "SUSP"])].copy()
-    gt = gt[~gt["EVENT_DATE"].isna()].copy()
+    # Keep only REC and SUSP events with valid EVENT_DATE for now
+    gt_filtered = gt[gt["EVENT"].isin(["REC", "SUSP"]) & ~gt["EVENT_DATE"].isna()].copy()
+
+    # Determine all patients from the raw file (EMPI was forward-filled)
+    all_empi = gt_raw[empi_col].dropna().astype(str).unique().tolist()
+
+    # Build a map EMPI -> INDEX_SURGERY (first available, already forward-filled)
+    index_map = gt_raw.groupby(empi_col)[eindexsurgery_col].first().astype(str).apply(to_ym_str).to_dict()
+
+    # For patients without any REC/SUSP events, add a NOREC row with empty EVENT_DATE
+    patients_with_events = set(gt_filtered["EMPI"].astype(str).tolist())
+    norec_rows = []
+    for pid in all_empi:
+        pid_str = str(pid)
+        if pid_str not in patients_with_events:
+            norec_rows.append({
+                "EMPI": pid_str,
+                "INDEX_SURGERY": index_map.get(pid, "") or "",
+                "EVENT": "NOREC",
+                "EVENT_DATE": ""
+            })
+
+    # Combine the REC/SUSP events with the NOREC filler rows
+    gt_final = pd.concat([gt_filtered, pd.DataFrame(norec_rows)], ignore_index=True, sort=False)
 
     # Optional: drop duplicates
-    gt = gt.drop_duplicates(subset=["EMPI", "EVENT", "EVENT_DATE"]).reset_index(drop=True)
+    gt_final = gt_final.drop_duplicates(subset=["EMPI", "EVENT", "EVENT_DATE"]).reset_index(drop=True)
 
     # Save if you want
-    gt.to_csv("ground_truth_events.csv", index=False)
+    gt_final.to_csv("ground_truth_events.csv", index=False)
 
-    print("gt shape:", gt.shape)
-    print(f"First three GT rows:\n{gt.head(3)}\n")
-    print(f"GT event distribution:\n{gt['EVENT'].value_counts()}\n")
-    print("Any SUSPICIOUS events in GT?", (gt["EVENT"] == "SUSPICIOUS").any())
+    print("gt shape:", gt_final.shape)
+    print(f"First three GT rows:\n{gt_final.head(3)}\n")
+    print(f"GT event distribution:\n{gt_final['EVENT'].value_counts()}\n")
+    print("Any SUSPICIOUS events in GT?", (gt_final["EVENT"] == "SUSPICIOUS").any())
     
-    return gt
+    return gt_final
 
 
 if __name__ == '__main__':
