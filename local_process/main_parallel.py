@@ -3,7 +3,9 @@
 Recurrence Extraction Script for Lung Cancer VIS Notes
 
 Usage:
-    python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300 --prompts ./prompts/recurrence_prompt_1107.yaml --prompt_version 11073 --output ./outputs
+    python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300 --prompts ./prompts/recurrence_prompt_1113.yaml --prompt_version 1113 --output ./outputs
+
+    # run full cohort 
 
 Examples:
     # Sequential processing (Mac/single slot)
@@ -79,7 +81,7 @@ async def process_patient_recurrence_task(
     shared_processor = TextProcessor(
             model_name=model_name,
             api_model=False,
-            prompt="{report}",
+            prompt="",
             system_prompt=system_prompt,
             temperature=0.1,
             grammar="",
@@ -101,10 +103,22 @@ async def process_patient_recurrence_task(
             first_lung_surgery_date=first_surgery_date,
             vis_note_text=vis_text
         )
+        processor = TextProcessor(
+            model_name=model_name,
+            api_model=False,
+            prompt="",
+            system_prompt=system_prompt,
+            temperature=0.1,
+            grammar="",
+            n_predict=4096,
+            chat_endpoint=True,
+            debug=False,
+            llamacpp_port=llamacpp_port
+        )
         
         texts = [{"id": vis_report['id'], "text": user_prompt}]
         try:
-            results = await shared_processor.process_all_texts(texts)
+            results = await processor.process_all_texts(texts)
             output_json = None
             if results and results[0] and not results[0].get('error'):
                 result = results[0]
@@ -194,7 +208,7 @@ async def process_patient_parallel(
         processor = TextProcessor(
             model_name=model_name,
             api_model=False,
-            prompt=user_prompt,
+            prompt="",
             system_prompt=system_prompt,
             temperature=0.1,
             grammar="",
@@ -204,7 +218,7 @@ async def process_patient_parallel(
             llamacpp_port=llamacpp_port
         )
         
-        texts = [{"id": vis_report['id'], "text": vis_text}]
+        texts = [{"id": vis_report['id'], "text": user_prompt}]
         try:
             results = await processor.process_all_texts(texts)
             output_json = None
@@ -278,7 +292,9 @@ async def main(args):
     
     # Load patient metadata
     patient_meta = pd.read_csv(args.groundtruth)
-    patient_meta['EMPI'] = patient_meta['EMPI'].astype(str)
+    # only keep the EMPI + indexSurgery rows with values
+    patient_meta = patient_meta[patient_meta['EMPI'].notna() & patient_meta['indexSurgery'].notna()]
+    patient_meta['EMPI'] = patient_meta['EMPI'].astype(int).astype(str)
 
     # --- logging setup: write logs to outputs/logs/... and to console ---
     log_dir = Path(args.output) / "logs"
@@ -297,17 +313,42 @@ async def main(args):
     logger.info("Started run — model=%s prompt_version=%s", args.model, args.prompt_version)
     logger.info("Log file: %s", str(log_file))
 
+    try:
+        from hashlib import sha256
+        prompts_src = Path(args.prompts)
+        dest_folder = Path(args.output) / "recurrence_task" / args.model / str(args.prompt_version)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        if prompts_src.exists():
+            prompt_bytes = prompts_src.read_bytes()
+            prompt_hash = sha256(prompt_bytes).hexdigest()
+            # copy canonical prompt content into the run folder with shorthash
+            dest_prompt = dest_folder / f"prompt_{prompt_hash[:8]}.yaml"
+            if not dest_prompt.exists():
+                dest_prompt.write_bytes(prompt_bytes)
+            # write metadata
+            meta = {
+                "prompt_file_original": str(prompts_src.resolve()),
+                "prompt_file_copied": str(dest_prompt),
+                "prompt_hash": prompt_hash,
+                "prompt_version": args.prompt_version,
+                "model": args.model,
+                "saved_at": datetime.now().isoformat()
+            }
+            (dest_folder / "prompt_metadata.json").write_text(json.dumps(meta, indent=2))
+            logger.info("Saved prompt to %s (sha256=%s)", dest_prompt, prompt_hash[:8])
+        else:
+            logger.warning("Prompts file not found: %s — skipping prompt save", prompts_src)
+    except Exception as e:
+        logger.warning("Failed to persist prompt file: %s", e)
+
     logger.info("Loading patient metadata from: %s", args.groundtruth)
 
-    patient_meta = pd.read_csv(args.groundtruth)
-    patient_meta['EMPI'] = patient_meta['EMPI'].astype(str)
-    
     # Get patient IDs to process
     if args.patient_ids:
         patient_ids = [str(pid) for pid in args.patient_ids]
         logger.info("Processing %d specified patients", len(patient_ids))
     else:
-        patient_ids = patient_meta["EMPI"].astype(str).tolist()
+        patient_ids = patient_meta["EMPI"].tolist()
         logger.info("Processing all %d patients", len(patient_ids))    
 
     if args.skip_existing:
@@ -441,7 +482,7 @@ def parse_arguments():
     parser.add_argument(
         "--groundtruth",
         type=str,
-        default="/vast/florian/carlotta/data/groundtruth_recurrence.csv",
+        default="/vast/florian/carlotta/data/gt_automatic_eval_v1.csv",
         help="Path to ground truth CSV with patient metadata (default: %(default)s)"
     )
     
