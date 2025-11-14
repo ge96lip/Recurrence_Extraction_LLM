@@ -15,7 +15,7 @@ Examples:
     python main_parallel.py --model Qwen3-Instruct --parallel 4 --max-vis 300
     
     # Process specific patients only
-    python main_parallel.py --model Qwen3-Instruct --patient-ids 104352354 107373506
+    python main_parallel.py --model Qwen3-Instruct  --parallel 4 --max-vis 300 --patient-ids 100072762 100092590 --prompts ./prompts/recurrence_prompt_1113.yaml --prompt_version 11133 --output ./outputs
 """
 
 import argparse
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Add local_process to path
 sys.path.append('/vast/florian/carlotta/LLMAIx/local_process')
 
-from process_local import TextProcessor, load_prompts_config
+from process_local_v2 import TextProcessor, load_prompts_config
 from utils import extract_single_reports
 
 
@@ -77,36 +77,23 @@ async def process_patient_recurrence_task(
     prompts_config = load_prompts_config(prompts_file)
     system_prompt = prompts_config['system_prompt']
     user_prompt_template = prompts_config['user_prompt']
-
-    shared_processor = TextProcessor(
-            model_name=model_name,
-            api_model=False,
-            prompt="",
-            system_prompt=system_prompt,
-            temperature=0.1,
-            grammar="",
-            n_predict=4096,
-            chat_endpoint=True,
-            debug=False,
-            llamacpp_port=llamacpp_port
-        )
     
     recurrence_results = []
+    user_prompt_template = prompts_config['user_prompt']
     for i, vis_report in enumerate(vis_reports):
         if i % 10 == 0:
             logger.info("Processing VIS report %d/%d for patient %s", i+1, len(vis_reports), patient_id)
 
         vis_date = vis_report['note_date']
         vis_text = vis_report['text']
-        
-        user_prompt = user_prompt_template.format(
-            first_lung_surgery_date=first_surgery_date,
-            vis_note_text=vis_text
-        )
+        logger.info("VIS %s: date=%s, text_length=%d, preview=%s...", 
+                   vis_report['id'], vis_date, len(vis_text), vis_text[:100])
+    
+
         processor = TextProcessor(
             model_name=model_name,
             api_model=False,
-            prompt="",
+            prompt=user_prompt_template,
             system_prompt=system_prompt,
             temperature=0.1,
             grammar="",
@@ -116,10 +103,19 @@ async def process_patient_recurrence_task(
             llamacpp_port=llamacpp_port
         )
         
-        texts = [{"id": vis_report['id'], "text": user_prompt}]
+        # texts = [{"id": vis_report['id'], "text": user_prompt}]
+        texts = [{
+            "id": vis_report['id'],
+            "text": vis_text,
+            "note_date": vis_date,
+            "report_description": f"VIS report for patient after surgery on {first_surgery_date}"
+        }]
+        logger.info("User prompt length: %d", len(texts))
         try:
+            #print(f"texts is: {texts}")
             results = await processor.process_all_texts(texts)
             output_json = None
+            print(f"Results: {results}")
             if results and results[0] and not results[0].get('error'):
                 result = results[0]
                 content = result.get('content', '')
