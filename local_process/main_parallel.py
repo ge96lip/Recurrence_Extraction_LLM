@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Add local_process to path
 sys.path.append('/vast/florian/carlotta/LLMAIx/local_process')
 
-from process_local_v2 import TextProcessor, load_prompts_config
+from process_local import TextProcessor, load_prompts_config
 from utils import extract_single_reports
 
 
@@ -94,7 +94,7 @@ async def process_patient_recurrence_task(
             model_name=model_name,
             api_model=False,
             prompt=user_prompt_template,
-            system_prompt=system_prompt,
+            # system_prompt=system_prompt,
             temperature=0.1,
             grammar="",
             n_predict=4096,
@@ -141,120 +141,6 @@ async def process_patient_recurrence_task(
 
     # Save results
     date = datetime.now().strftime("%m%d")
-    output_folder = os.path.join(output_root, "recurrence_task", model_name, prompt_version, str(patient_id))
-    os.makedirs(output_folder, exist_ok=True)
-    output_file = os.path.join(output_folder, "output.json")
-    with open(output_file, 'w') as f:
-        json.dump(recurrence_results, f, indent=2, default=str)
-
-    logger.info("Saved patient %s output to %s", patient_id, output_file)
-    return recurrence_results
-
-
-async def process_patient_parallel(
-    patient_id: str, 
-    data_dir: str, 
-    prompts_file: str, 
-    prompt_version: str,
-    patient_meta: pd.DataFrame, 
-    output_root: str, 
-    max_vis_reports: int = None, 
-    max_concurrent: int = 4,
-    model_name: str = "Qwen3-Instruct",
-    llamacpp_port: int = 8080
-):
-    """Process VIS reports in parallel batches (for GPU with --parallel > 1)."""
-    logger.info("Processing patient_id: %s", patient_id)
-
-    # Get patient metadata
-    patient_row = patient_meta[patient_meta["EMPI"] == str(patient_id)]
-    if patient_row.empty:
-        logger.error("Patient %s not found in patient_meta!", patient_id)
-        return None
-    
-    first_surgery_date = patient_row['indexSurgery'].iloc[0]
-    if pd.isna(first_surgery_date) or not first_surgery_date:
-        logger.error("Missing first lung surgery date for patient %s", patient_id)
-        return None
-
-    vis_reports = extract_single_reports(data_dir, patient_id, 'VIS')
-    if not vis_reports:
-        logger.error("No VIS reports found for patient %s", patient_id)
-        return None
-    if max_vis_reports:
-        vis_reports = vis_reports[:max_vis_reports]
-
-    logger.info("Processing %d VIS reports in batches of %d", len(vis_reports), max_concurrent)
-    
-    # Load prompts config once
-    prompts_config = load_prompts_config(prompts_file)
-    system_prompt = prompts_config['system_prompt']
-    user_prompt_template = prompts_config['user_prompt']
-    
-    async def process_single_vis(vis_report):
-        """Process a single VIS report"""
-        vis_date = vis_report['note_date']
-        vis_text = vis_report['text']
-        
-        user_prompt = user_prompt_template.format(
-            first_lung_surgery_date=first_surgery_date,
-            vis_note_text=vis_text
-        )
-        
-        processor = TextProcessor(
-            model_name=model_name,
-            api_model=False,
-            prompt="",
-            system_prompt=system_prompt,
-            temperature=0.1,
-            grammar="",
-            n_predict=4096,
-            chat_endpoint=True,
-            debug=False,
-            llamacpp_port=llamacpp_port
-        )
-        
-        texts = [{"id": vis_report['id'], "text": user_prompt}]
-        try:
-            results = await processor.process_all_texts(texts)
-            output_json = None
-            if results and results[0] and not results[0].get('error'):
-                result = results[0]
-                content = result.get('content', '')
-                if '```json' in content:
-                    content = content.split('```json')[-1].split('```')[0]
-                try:
-                    output_json = json.loads(content)
-                except Exception as e:
-                    logger.error("Failed to parse JSON for %s VIS %s: %s", patient_id, vis_report['id'], e)
-
-            return {
-                "vis_id": vis_report['id'],
-                "vis_date": vis_date,
-                "surgery_date": str(first_surgery_date),
-                "output": output_json if output_json else {"error": True}
-            }
-        except Exception as e:
-            logger.error("Exception for %s VIS %s: %s", patient_id, vis_report['id'], e)
-            return {
-                "vis_id": vis_report['id'],
-                "vis_date": vis_date,
-                "surgery_date": str(first_surgery_date),
-                "output": {"error": str(e)}
-            }
-    
-    # Process VIS reports in parallel batches
-    recurrence_results = []
-    for i in range(0, len(vis_reports), max_concurrent):
-        batch = vis_reports[i:i + max_concurrent]
-        logger.info("Processing VIS batch %d/%d (%d reports)", i//max_concurrent + 1, (len(vis_reports)-1)//max_concurrent + 1, len(batch))
-        
-        # Process batch concurrently
-        batch_results = await asyncio.gather(*[process_single_vis(vis) for vis in batch])
-        recurrence_results.extend(batch_results)
-    
-    # Save results
-    date = "1031" # datetime.now().strftime("%m%d")
     output_folder = os.path.join(output_root, "recurrence_task", model_name, prompt_version, str(patient_id))
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, "output.json")
