@@ -115,14 +115,14 @@ class TextProcessor:
         data = {
             "model": "llmaix",
             "messages": [
-                {"role": "system", "content": self.system_prompt},
+    -            {"role": "system", "content": self.system_prompt},  # ← Remove this!
                 {"role": "user", "content": prompt_formatted}
             ],
             "seed": self.seed,
             "temperature": self.temperature,
             "top_k": self.top_k,
             "top_p": self.top_p, 
-            "max_tokens": self.n_predict, 
+            "max_tokens": self.n_predict,
             "cache_prompt": False,
             "stop": ["<|im_end|>", "<|eot_id|>", "</s>"] 
         }
@@ -191,7 +191,7 @@ class TextProcessor:
                     content = result["choices"][0]["message"]["content"]
                     print(f"OpenAI Chat Result: {content}")
                 else:
-                    print(f"Prompt formatted for local chat:\n{prompt_formatted}\n")
+                    # print(f"Prompt formatted for local chat:\n{prompt_formatted}\n")
                     result = await self.fetch_chat_result_local(session, prompt_formatted)
                     content = result["choices"][0]["message"]["content"]
                     #print(f"Local Chat Result: {content}")
@@ -219,7 +219,7 @@ class TextProcessor:
         semaphore = asyncio.Semaphore(3)  # Limit concurrent requests
 
         async def process_with_semaphore(session, text_data):
-            print(f"text data is: {text_data}")
+            # print(f"text data is: {text_data}")
             async with semaphore:
                 return await self.process_text(
                     session, 
@@ -525,224 +525,3 @@ def extract_content(res, modality):
         print(f"Traceback: {traceback.format_exc()}")
         return None
 
-
-async def main():
-    parser = argparse.ArgumentParser(description='Process text files with LLM')
-    
-    # Input/output arguments
-    parser.add_argument('--input_dir', default=f'/vast/florian/carlotta/data/timeline_ds_STS', help='Directory containing .txt files to process') # data/auxiliary_task_reports/{patient_id}
-    parser.add_argument('--patient_id_file', default='patient_ids.yaml', help='YAML file containing patient ID')
-    # Model arguments
-    parser.add_argument('--model_name', '-m', required=True, 
-                       help='Model filename or API model name')
-    parser.add_argument('--chat_endpoint', action='store_true', 
-                       help='Use chat endpoint instead of completion')
-    # default is False
-    parser.add_argument('--api_model', action='store_true', 
-                       help='Use OpenAI-compatible API instead of local model')
-
-    # LLM parameters
-    parser.add_argument('--temperature', '-t', type=float, default=0.1,
-                       help='Temperature (0.0-1.0)')
-    parser.add_argument('--n_predict', '-n', type=int, default=512,
-                       help='Maximum tokens to predict')
-    parser.add_argument('--top_k', type=int, default=30, help='Top-k sampling')
-    parser.add_argument('--top_p', type=float, default=0.9, help='Top-p sampling')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-
-    # Grammar and schema
-    parser.add_argument('--prompts-file', default='./prompts/event_extraction_OPN.yaml', 
-                   help='YAML file containing prompts and grammar (default: prompts.yaml)')
-
-    parser.add_argument('--json_schema', help='JSON schema for structured output')
-
-    parser.add_argument('--config_file', default='models/config.yml',
-                       help='Model configuration file')
-    parser.add_argument('--llamacpp_port', type=int, default=8080,
-                       help='llama.cpp server port')
-    parser.add_argument('--debug', action='store_true', 
-                       help='Enable debug output')
-    
-    parser.add_argument('--per_report', action='store_true', 
-                       help='Process each report separately instead of combining into full history')
-    parser.add_argument('--modality', type=str, default='VIS', help='Modality for report extraction (e.g., RAD, PAT, OPN, PRG)')
-    args = parser.parse_args()
-
-    prompts_config = load_prompts_config(args.prompts_file)
-
-    
-    system_prompt = prompts_config['system_prompt']
-    user_prompt = prompts_config['user_prompt']
-    grammar = prompts_config['grammar']
-    num_text = 3
-    print(f"Modality: {args.modality}")
-    # get patient_id from yaml file
-    if not os.path.exists(args.patient_id_file):
-        print(f"Error: Patient ID file {args.patient_id_file} not found")
-        return 1
-
-    with open(args.patient_id_file, 'r') as f:
-        data = yaml.safe_load(f)
-        patient_ids = data["patient_id"]
-
-    raw_dir = f"outputs/{args.model_name}"
-    OUTPUT_FILE = 'outputs/all_model_results.json'
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    summary = []
-    successful = 0
-    failed = 0
-    # loop all the below logics for each patient_id
-    for patient_id in patient_ids:
-        events = []
-        print(f"Processing patient ID: {patient_id}")
-        # Validate input directory
-        if not os.path.isdir(args.input_dir):
-            print(f"Error: Input directory {args.input_dir} does not exist")
-            return 1
-
-        # Read text files
-        if args.per_report:
-            print(f"Analysing text files from: {args.input_dir} seperately")
-            texts = extract_single_reports(args.input_dir, patient_id, args.modality)
-
-            if not texts:
-                print("No .txt files found in input directory")
-                return 1
-            if num_text > len(texts):
-                texts = texts[:num_text]
-
-            print(f"Found {len(texts)} text files to process")
-        else: 
-            # full history 
-            print(f"Combining all text files from: {args.input_dir} into one history")
-            
-            full_history = extract_mod_reports(args.input_dir, patient_id, args.modality)
-            os.makedirs(f"../../data/{args.modality}/", exist_ok=True)
-            # save full history to a text file
-            with open(f"../../data/{args.modality}/full_history_{patient_id}.txt", "w", encoding="utf-8") as f:
-                f.write(full_history)
-
-            texts = [{"id": "full_history", "text": full_history, "filename": f"full_history_{patient_id}_{args.modality}.txt"}]
-
-        # Initialize processor
-        processor = TextProcessor(
-            model_name=args.model_name,
-            api_model=args.api_model,
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            temperature=args.temperature,
-            grammar=grammar or "",
-            json_schema=args.json_schema or "",
-            n_predict=args.n_predict,
-            chat_endpoint=args.chat_endpoint,
-            debug=args.debug,
-            llamacpp_port=args.llamacpp_port,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=args.seed
-        )
-
-        print(f"Processing texts with model: {args.model_name}")
-        print(f"Using {'chat' if args.chat_endpoint else 'completion'} endpoint")
-        print(f"Using {'API' if args.api_model else 'local'} model")
-
-        # Process input
-        start_time = time.time()
-        
-        result = await processor.process_all_texts(texts)
-        end_time = time.time()
-        
-        print(f"Processing completed in {end_time - start_time:.2f} seconds")
-
-        # Save raw model output to text file
-        raw_output_file = os.path.join(raw_dir, f"{args.modality}/raw_output_{patient_id}.txt")
-        with open(raw_output_file, 'w', encoding='utf-8') as f:
-            f.write(f"Raw Model Output for Patient {patient_id}\n")
-            f.write("="*80 + "\n\n")
-            for res in result:
-                if isinstance(res, Exception):
-                    f.write(f"ERROR: {str(res)}\n\n")
-                else:
-                    f.write(f"ID: {res.get('id', 'unknown')}\n")
-                    f.write("-"*80 + "\n")
-                    f.write(f"CONTENT:\n{res.get('content', '')}\n")
-                    f.write("="*80 + "\n\n")
-        print(f"Raw model output saved to: {raw_output_file}")
-
-        for res in result:
-            if isinstance(res, Exception):
-                continue
-                
-            if isinstance(res, dict) and 'content' in res and not res.get('error'):
-                event = extract_content(res, args.modality)
-                if event:
-                    events.append(event)
-            elif isinstance(res, list):
-                # handle nested event lists
-                for ev in res:
-                    if isinstance(ev, dict) and 'content' in ev and not ev.get('error'):
-                        event = extract_content(ev, args.modality)
-                        if event:
-                            events.append(event)
-
-        # Update success/failure tracking                    
-        if any(not isinstance(res, Exception) and not res.get('error') for res in result):
-            successful += 1
-        else:
-            failed += 1
-
-        # Enhanced summary with new fields
-        summary.append({
-            "task": "event_extraction_report",
-            "model": args.model_name,
-            "patient_id": patient_id,
-            "total_surgeries": sum(e.get('surgery_count', 0) for e in events),
-            "total_diagnoses": sum(e.get('diagnosis_count', 0) for e in events),
-            "events_extracted": events
-        })
-
-    with open(f"outputs/summary_{args.model_name}.json", "w") as fsum:
-        json.dump(summary, fsum, indent=2)
-
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, "r") as f:
-            all_results = json.load(f)
-    else:
-        all_results = []
-
-    all_results.extend(summary)
-
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(all_results, f, indent=2)
-        # Save results
-        # df, error_count = postprocess_grammar(result, debug=args.debug)
-        
-        # Save the processed DataFrame
-        # df.to_csv(f"results/resultsfullhistory{patient_id}.csv", index=False)
-
-        
-    # Print summary
-    # successful = sum(1 for r in result if not isinstance(r, Exception) and not r.get("error"))
-    # failed = len(result) - successful
-
-    print(f"\nSummary:")
-    print(f"- Total files: {len(patient_ids)}")
-    print(f"- Successful: {successful}")
-    print(f"- Failed: {failed}")
-
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        exit_code = asyncio.run(main())
-        exit(exit_code)
-    except KeyboardInterrupt:
-        print("\nProcessing interrupted by user")
-        exit(1)
-    except Exception as e:
-        print(f"\nUnexpected error: {e}")
-        if "--debug" in os.sys.argv:
-            traceback.print_exc()
-        exit(1)
